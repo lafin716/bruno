@@ -7,6 +7,20 @@ const StyledWrapper = styled.div`
   min-width: 0;
   box-sizing: border-box;
 
+  .ai-import-muted {
+    color: ${(props) => props.theme.colors.text.muted};
+    line-height: 1.6;
+  }
+
+  .ai-import-preview {
+    border: 1px solid ${(props) => props.theme.input.border};
+    border-radius: ${(props) => props.theme.border.radius.md};
+    background: ${(props) => props.theme.input.bg};
+    max-height: 40vh;
+    overflow-y: auto;
+    overflow-wrap: anywhere;
+  }
+
   .tabs {
     .tab {
       padding: 6px 0px;

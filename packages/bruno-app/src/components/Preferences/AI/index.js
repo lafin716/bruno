@@ -15,11 +15,40 @@ import { clearAiApiKey, getAiStatus } from 'utils/ai';
 import ProviderCard from './ProviderCard';
 import CompatEndpointCard from './CompatEndpointCard';
 import AutocompletePane from './AutocompletePane';
+import LocalProvidersPane from './LocalProvidersPane';
 import SecurityPane from './SecurityPane';
 import StyledWrapper from './StyledWrapper';
 
 const OPENAI_COMPATIBLE_PREFIX = 'openai-compatible:';
 const isCompatProviderId = (id) => typeof id === 'string' && id.startsWith(OPENAI_COMPATIBLE_PREFIX);
+const DEFAULT_LOCAL_PROVIDERS = {
+  preferredProvider: 'codex',
+  codex: {
+    enabled: false,
+    executable: 'codex',
+    model: ''
+  },
+  claude: {
+    enabled: false,
+    executable: 'claude',
+    model: ''
+  }
+};
+
+const getLocalProviders = (ai) => {
+  const localProviders = ai?.localProviders || {};
+  return {
+    preferredProvider: localProviders.preferredProvider || DEFAULT_LOCAL_PROVIDERS.preferredProvider,
+    codex: {
+      ...DEFAULT_LOCAL_PROVIDERS.codex,
+      ...(localProviders.codex || {})
+    },
+    claude: {
+      ...DEFAULT_LOCAL_PROVIDERS.claude,
+      ...(localProviders.claude || {})
+    }
+  };
+};
 
 const aiPreferencesSchema = Yup.object().shape({
   enabled: Yup.boolean(),
@@ -44,6 +73,19 @@ const aiPreferencesSchema = Yup.object().shape({
     enabled: Yup.boolean(),
     model: Yup.string().max(200).nullable(),
     triggerMode: Yup.string().oneOf(['aggressive', 'debounced', 'manual']).nullable()
+  }),
+  localProviders: Yup.object().shape({
+    preferredProvider: Yup.string().oneOf(['codex', 'claude']).required(),
+    codex: Yup.object().shape({
+      enabled: Yup.boolean(),
+      executable: Yup.string().max(500).required(),
+      model: Yup.string().max(200).nullable()
+    }),
+    claude: Yup.object().shape({
+      enabled: Yup.boolean(),
+      executable: Yup.string().max(500).required(),
+      model: Yup.string().max(200).nullable()
+    })
   }),
   security: Yup.object().shape({
     redactHeaders: Yup.boolean(),
@@ -83,6 +125,7 @@ const AI = () => {
   }, [refreshStatus]);
 
   const providerIds = status ? Object.keys(status.providers) : [];
+  const preferenceAi = preferences.ai || {};
 
   const formik = useFormik({
     enableReinitialize: true,
@@ -106,6 +149,7 @@ const AI = () => {
         model: get(preferences, 'ai.autocomplete.model', ''),
         triggerMode: get(preferences, 'ai.autocomplete.triggerMode', 'debounced')
       },
+      localProviders: getLocalProviders(preferenceAi),
       security: {
         redactHeaders: get(preferences, 'ai.security.redactHeaders', true),
         redactBody: get(preferences, 'ai.security.redactBody', true),
@@ -135,6 +179,7 @@ const AI = () => {
               model: values.autocomplete?.model || '',
               triggerMode: values.autocomplete?.triggerMode || 'debounced'
             },
+            localProviders: getLocalProviders({ localProviders: values.localProviders }),
             security: {
               redactHeaders: values.security?.redactHeaders !== false,
               redactBody: values.security?.redactBody !== false,
@@ -170,6 +215,15 @@ const AI = () => {
         .catch(() => {});
     }, 400),
     []
+  );
+
+  const saveValuesNow = useCallback(
+    async (values) => {
+      debouncedSave.cancel();
+      const validated = await aiPreferencesSchema.validate(values, { abortEarly: true });
+      await handleSaveRef.current(validated);
+    },
+    [debouncedSave]
   );
 
   useEffect(() => {
@@ -340,6 +394,17 @@ const AI = () => {
         >
           <IconShieldLock size={14} strokeWidth={1.5} />
           Security
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === 'local'}
+          className={`ai-tab ${activeTab === 'local' ? 'active' : ''}`}
+          onClick={() => setActiveTab('local')}
+          data-testid="ai-tab-local"
+        >
+          <IconTerminal2 size={14} strokeWidth={1.5} />
+          Local CLI
         </button>
       </div>
 
@@ -521,6 +586,18 @@ const AI = () => {
             onToggleRedactResponse={(next) => saveSecurityImmediate({ redactResponse: next })}
             onChangeCustomRedactedHeaders={(next) => saveSecurityImmediate({ customRedactedHeaders: next })}
             onChangeCustomRedactedVariables={(next) => saveSecurityImmediate({ customRedactedVariables: next })}
+          />
+        </div>
+      )}
+
+      {activeTab === 'local' && (
+        <div className="ai-tab-panel" role="tabpanel">
+          <LocalProvidersPane
+            aiEnabled={formik.values.enabled}
+            localProviders={formik.values.localProviders}
+            dirty={formik.dirty}
+            onChange={(next) => formik.setFieldValue('localProviders', next)}
+            onSaveBeforeTest={() => saveValuesNow(formik.values)}
           />
         </div>
       )}

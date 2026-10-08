@@ -81,6 +81,11 @@ const initialState = {
       },
       models: {},
       defaultModel: '',
+      localProviders: {
+        preferredProvider: 'codex',
+        codex: { enabled: false, executable: 'codex', model: '' },
+        claude: { enabled: false, executable: 'claude', model: '' }
+      },
       autocomplete: {
         enabled: true,
         model: '',

@@ -90,6 +90,11 @@ const defaultPreferences = {
     models: {},
     defaultModel: '',
     openaiCompatibleEndpoints: [],
+    localProviders: {
+      preferredProvider: 'codex',
+      codex: { enabled: false, executable: 'codex', model: '' },
+      claude: { enabled: false, executable: 'claude', model: '' }
+    },
     autocomplete: {
       enabled: true,
       model: '',
@@ -208,6 +213,19 @@ const preferencesSchema = Yup.object().shape({
     providers: Yup.object().optional(),
     models: Yup.object().optional(),
     defaultModel: Yup.string().max(200).nullable(),
+    localProviders: Yup.object({
+      preferredProvider: Yup.string().oneOf(['codex', 'claude']),
+      codex: Yup.object({
+        enabled: Yup.boolean(),
+        executable: Yup.string().max(4096),
+        model: Yup.string().max(200)
+      }),
+      claude: Yup.object({
+        enabled: Yup.boolean(),
+        executable: Yup.string().max(4096),
+        model: Yup.string().max(200)
+      })
+    }).optional(),
     openaiCompatibleEndpoints: Yup.array().of(
       Yup.object({
         id: Yup.string().required(),

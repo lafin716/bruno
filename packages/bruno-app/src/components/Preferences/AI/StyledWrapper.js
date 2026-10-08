@@ -4,11 +4,13 @@ const StyledWrapper = styled.div`
   color: ${(props) => props.theme.text};
 
   .ai-tabs {
+    flex-wrap: wrap;
     border-bottom: 1px solid ${(props) => props.theme.input.border};
     margin-bottom: 14px;
   }
 
   .ai-tab {
+    white-space: nowrap;
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -379,6 +381,43 @@ const StyledWrapper = styled.div`
       background: ${(props) => props.theme.bg};
       border: 1px solid ${(props) => props.theme.input.border};
       border-radius: 3px;
+    }
+  }
+
+  .local-card {
+    border: 1px solid ${(props) => props.theme.input.border};
+    border-radius: ${(props) => props.theme.border.radius.md};
+    background: ${(props) => props.theme.input.bg};
+  }
+
+  .local-sub {
+    color: ${(props) => props.theme.colors.text.muted};
+
+    code {
+      font-family: ${(props) => props.theme.font.monospace || 'monospace'};
+      color: ${(props) => props.theme.text};
+    }
+  }
+
+  .local-unsaved {
+    color: ${(props) => props.theme.colors.text.muted};
+    background: ${(props) => props.theme.colors.accent}08;
+    border: 1px dashed ${(props) => props.theme.colors.accent}55;
+    border-radius: ${(props) => props.theme.border.radius.md};
+  }
+
+  .local-provider:not(.expanded) .provider-body {
+    opacity: 0.6;
+  }
+
+  @media (max-width: 720px) {
+    .local-provider-grid {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .local-guidance {
+      align-items: flex-start;
+      flex-direction: column;
     }
   }
 

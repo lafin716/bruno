@@ -7,13 +7,16 @@ import StyledWrapper from './StyledWrapper';
 import FileTab from './FileTab';
 import GitHubTab from './GitHubTab';
 import UrlTab from './UrlTab';
+import AiTab from './AiTab';
+import IconSparkles from 'components/Icons/IconSparkles';
 import FullscreenLoader from './FullscreenLoader/index';
 import { useTheme } from 'providers/Theme';
 
 const IMPORT_TABS = {
   FILE: 'file',
   GITHUB: 'github',
-  URL: 'url'
+  URL: 'url',
+  AI: 'ai'
 };
 
 const ImportCollection = ({ onClose, handleSubmit }) => {
@@ -42,7 +45,7 @@ const ImportCollection = ({ onClose, handleSubmit }) => {
       <Modal size="md" title="Import Collection" hideFooter={true} handleCancel={onClose} dataTestId="import-collection-modal">
         <StyledWrapper className="flex flex-col h-full">
           <div className="flex w-full mb-6">
-            <div className="flex justify-start w-full tabs">
+            <div className="flex flex-wrap justify-start w-full tabs">
               <div
                 className={getTabClassname(IMPORT_TABS.FILE)}
                 onClick={handleTabSelect(IMPORT_TABS.FILE)}
@@ -67,6 +70,15 @@ const ImportCollection = ({ onClose, handleSubmit }) => {
                 <IconUnlink size={18} strokeWidth={1.5} className="mr-2" />
                 URL
               </div>
+              <button
+                type="button"
+                className={getTabClassname(IMPORT_TABS.AI)}
+                onClick={handleTabSelect(IMPORT_TABS.AI)}
+                data-testid="ai-import-tab"
+              >
+                <IconSparkles size={18} className="mr-2" />
+                AI
+              </button>
             </div>
           </div>
 
@@ -117,6 +129,7 @@ const ImportCollection = ({ onClose, handleSubmit }) => {
               setErrorMessage={setErrorMessage}
             />
           )}
+          {tab === IMPORT_TABS.AI && <AiTab handleSubmit={handleSubmit} setErrorMessage={setErrorMessage} />}
         </StyledWrapper>
       </Modal>
     </Portal>

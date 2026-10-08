@@ -30,6 +30,7 @@ const {
   formatSearchVariablesResult
 } = require('./context');
 const registerChatIpc = require('./chat');
+const { registerLocalAiIpc } = require('./local');
 
 const activeStreams = new Map();
 
@@ -99,6 +100,7 @@ const assertKnownProvider = (providerId) => {
 };
 
 const registerAiIpc = (mainWindow) => {
+  registerLocalAiIpc(mainWindow);
   const broadcastStatus = (status) => {
     if (mainWindow?.webContents && !mainWindow.webContents.isDestroyed()) {
       mainWindow.webContents.send('main:ai-status-changed', status);
