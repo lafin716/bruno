@@ -2,12 +2,13 @@ import { IconCopy, IconEdit, IconTrash, IconCheck, IconX, IconSearch, IconDevice
 import { useState, useRef, useEffect, useMemo } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 import { resolveEnvironmentInheritance } from '@usebruno/common/utils';
-import { renameEnvironment, saveEnvironmentExtends, updateEnvironmentColor } from 'providers/ReduxStore/slices/collections/actions';
+import { renameEnvironment, saveEnvironmentExtends, saveExternalSecrets, updateEnvironmentColor } from 'providers/ReduxStore/slices/collections/actions';
 import { validateName, validateNameError } from 'utils/common/regex';
 import toast from 'react-hot-toast';
 import CopyEnvironment from 'components/Environments/EnvironmentSettings/CopyEnvironment';
 import DeleteEnvironment from 'components/Environments/EnvironmentSettings/DeleteEnvironment';
 import EnvironmentVariables from './EnvironmentVariables';
+import ExternalSecrets from 'components/Environments/ExternalSecrets';
 import InheritsFrom from 'components/Environments/Common/InheritsFrom';
 import EnvironmentInheritanceWarning from 'components/Environments/Common/EnvironmentInheritanceWarning';
 import ColorPicker from 'components/ColorPicker';
@@ -190,6 +191,10 @@ const EnvironmentDetails = ({ environment, setIsModified, collection, searchQuer
 
   const handleSaveAll = () => {
     window.dispatchEvent(new Event('environment-save-all'));
+    Object.entries(collection.externalSecretsDrafts || {}).forEach(([environmentUid, externalSecrets]) => {
+      dispatch(saveExternalSecrets(externalSecrets, environmentUid, collection.uid))
+        .catch(() => toast.error('Failed to save AWS secret references'));
+    });
   };
 
   return (
@@ -272,10 +277,10 @@ const EnvironmentDetails = ({ environment, setIsModified, collection, searchQuer
 
       <div className="tabs-container">
         <ResponsiveTabs
-          tabs={tabs}
+          tabs={[...tabs, { key: 'external-secrets', label: 'External Secrets', indicator: Object.hasOwn(collection?.externalSecretsDrafts || {}, environment.uid) ? '*' : null }]}
           activeTab={activeTab}
           onTabSelect={setActiveTab}
-          rightContent={(
+          rightContent={activeTab !== 'external-secrets' && (
             <div ref={rightContentRef} className="env-search-container">
               {isSearchExpanded ? (
                 <div className="search-input-wrapper">
@@ -318,14 +323,16 @@ const EnvironmentDetails = ({ environment, setIsModified, collection, searchQuer
       </div>
 
       <div className="content">
-        <EnvironmentVariables
-          environment={environment}
-          setIsModified={setIsModified}
-          collection={collection}
-          inheritedEnvironmentVariables={inheritedEnvironmentVariablesForActiveTab}
-          searchQuery={tableSearchQuery}
-          variableType={activeTab}
-        />
+        {activeTab === 'external-secrets' ? <ExternalSecrets key={environment.uid} environment={environment} collection={collection} /> : (
+          <EnvironmentVariables
+            environment={environment}
+            setIsModified={setIsModified}
+            collection={collection}
+            inheritedEnvironmentVariables={inheritedEnvironmentVariablesForActiveTab}
+            searchQuery={tableSearchQuery}
+            variableType={activeTab}
+          />
+        )}
       </div>
     </StyledWrapper>
   );

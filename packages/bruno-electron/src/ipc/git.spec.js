@@ -10,7 +10,7 @@ jest.mock('../utils/filesystem', () => ({
 }));
 
 const { getCollectionGitRepoUrl, listBranchesForRemoteUrl } = require('../utils/git');
-const { getCollectionGitRemoteUrl, handleListRemoteBranches } = require('./git');
+const { getCollectionGitRemoteUrl, handleListRemoteBranches, validateGitRepositoryUrl } = require('./git');
 
 describe('getCollectionGitRemoteUrl', () => {
   beforeEach(() => {
@@ -61,5 +61,23 @@ describe('handleListRemoteBranches', () => {
     await expect(handleListRemoteBranches({}, { url: '--upload-pack=touch /tmp/pwned' }))
       .rejects.toThrow('Repository URL is not valid');
     expect(listBranchesForRemoteUrl).not.toHaveBeenCalled();
+  });
+
+  it('rejects embedded HTTP credentials before invoking git', async () => {
+    await expect(handleListRemoteBranches({}, { url: 'https://token@gitlab.example.com/team/api.git' }))
+      .rejects.toThrow('Repository URL must not include credentials');
+    expect(listBranchesForRemoteUrl).not.toHaveBeenCalled();
+  });
+
+  it('rejects query parameters and fragments before invoking git', async () => {
+    await expect(handleListRemoteBranches({}, { url: 'https://gitlab.example.com/team/api.git?token=secret#frag' }))
+      .rejects.toThrow('Repository URL must not include query parameters or fragments');
+    expect(listBranchesForRemoteUrl).not.toHaveBeenCalled();
+  });
+});
+
+describe('validateGitRepositoryUrl', () => {
+  it('allows SSH URLs unchanged', () => {
+    expect(validateGitRepositoryUrl(' git@gitlab.example.com:team/api.git ')).toBe('git@gitlab.example.com:team/api.git');
   });
 });

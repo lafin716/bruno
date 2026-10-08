@@ -1,11 +1,12 @@
 import React, { useState } from 'react';
-import { IconFileImport, IconBrandGit, IconUnlink, IconX } from '@tabler/icons';
+import { IconFileImport, IconBrandGit, IconBrandGitlab, IconUnlink, IconX } from '@tabler/icons';
 import Modal from 'components/Modal';
 import Portal from 'components/Portal';
 import classnames from 'classnames';
 import StyledWrapper from './StyledWrapper';
 import FileTab from './FileTab';
 import GitHubTab from './GitHubTab';
+import GitLabTab from './GitLabTab';
 import UrlTab from './UrlTab';
 import FullscreenLoader from './FullscreenLoader/index';
 import { useTheme } from 'providers/Theme';
@@ -13,6 +14,7 @@ import { useTheme } from 'providers/Theme';
 const IMPORT_TABS = {
   FILE: 'file',
   GITHUB: 'github',
+  GITLAB: 'gitlab',
   URL: 'url'
 };
 
@@ -58,6 +60,14 @@ const ImportCollection = ({ onClose, handleSubmit }) => {
               >
                 <IconBrandGit size={18} strokeWidth={1.5} className="mr-2" />
                 Git Repository
+              </div>
+              <div
+                className={getTabClassname(IMPORT_TABS.GITLAB)}
+                onClick={handleTabSelect(IMPORT_TABS.GITLAB)}
+                data-testid="gitlab-tab"
+              >
+                <IconBrandGitlab size={18} strokeWidth={1.5} className="mr-2" />
+                GitLab
               </div>
               <div
                 className={getTabClassname(IMPORT_TABS.URL)}
@@ -106,6 +116,12 @@ const ImportCollection = ({ onClose, handleSubmit }) => {
           )}
           {tab === IMPORT_TABS.GITHUB && (
             <GitHubTab
+              handleSubmit={handleSubmit}
+              setErrorMessage={setErrorMessage}
+            />
+          )}
+          {tab === IMPORT_TABS.GITLAB && (
+            <GitLabTab
               handleSubmit={handleSubmit}
               setErrorMessage={setErrorMessage}
             />

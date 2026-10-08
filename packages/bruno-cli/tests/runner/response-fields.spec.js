@@ -25,6 +25,10 @@ jest.mock('../../src/utils/bru', () => ({
 jest.mock('../../src/utils/axios-instance', () => ({
   makeAxiosInstance: jest.fn()
 }));
+jest.mock('../../src/utils/persist-variables', () => ({
+  applyVariableUpdates: jest.fn(),
+  persistVariableUpdates: jest.fn()
+}));
 jest.mock('../../src/runner/awsv4auth-helper', () => ({
   addAwsV4Interceptor: jest.fn(),
   resolveAwsV4Credentials: jest.fn()
@@ -87,10 +91,11 @@ jest.mock('@usebruno/common', () => {
   };
 });
 
-const { ScriptRuntime } = require('@usebruno/js');
+const { ScriptRuntime, AssertRuntime } = require('@usebruno/js');
 const { makeAxiosInstance } = require('../../src/utils/axios-instance');
 const prepareRequest = require('../../src/runner/prepare-request');
 const { runSingleRequest } = require('../../src/runner/run-single-request');
+const { persistVariableUpdates } = require('../../src/utils/persist-variables');
 
 const baseItem = {
   pathname: '/test-collection/request.bru',
@@ -234,5 +239,84 @@ describe('runSingleRequest: duration and size fields (issue #7352)', () => {
     expect(result.response.duration).toBe(0);
     expect(result.response.size).toBe(0);
     expect(result.response.responseTime).toBe(0);
+  });
+});
+
+describe('runSingleRequest: AWS external secret protections', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    prepareRequest.mockResolvedValue({
+      method: 'GET',
+      url: 'http://example.com/api',
+      headers: {},
+      data: null,
+      settings: {},
+      script: { res: 'bru.setEnvVar("TOKEN", "secret")' }
+    });
+    makeAxiosInstance.mockReturnValue(jest.fn().mockResolvedValue({
+      status: 200,
+      statusText: 'OK',
+      headers: { get: () => null },
+      data: JSON.stringify({ ok: true }),
+      config: { metadata: { completedHopsTime: 1 } },
+      request: { protocol: 'http:', host: 'example.com', path: '/api' }
+    }));
+  });
+
+  it('forwards protected AWS names and values to persistence from script results', async () => {
+    ScriptRuntime.mockImplementation(() => ({
+      runResponseScript: jest.fn().mockResolvedValue({
+        envVariables: { TOKEN: 'secret', COPY: 'prefix-secret-suffix' },
+        results: []
+      })
+    }));
+
+    const protectedNames = new Set(['TOKEN']);
+    const protectedValues = new Set(['secret']);
+    await runSingleRequest(...baseArgs, { protectedNames, protectedValues });
+
+    expect(persistVariableUpdates).toHaveBeenCalledWith(expect.any(Object), expect.objectContaining({
+      protectedNames,
+      protectedValues
+    }));
+  });
+
+  it('redacts AWS secret values in assertion output descriptions and errors', async () => {
+    prepareRequest.mockResolvedValue({
+      method: 'GET',
+      url: 'http://example.com/api',
+      headers: {},
+      data: null,
+      settings: {},
+      assertions: [{ name: 'token' }]
+    });
+    AssertRuntime.mockImplementation(() => ({
+      runAssertions: jest.fn(() => [{
+        status: 'fail',
+        description: 'secret-token description',
+        error: 'secret-token error'
+      }])
+    }));
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    let output = '';
+
+    try {
+      await runSingleRequest(
+        { ...baseItem, request: { ...baseItem.request, assertions: [{ name: 'token' }] } },
+        ...baseArgs.slice(1),
+        {
+          redactor: (value) => typeof value === 'string'
+            ? value.replaceAll('secret-token', '[AWS_SECRET_REDACTED]')
+            : value
+        }
+      );
+      output = logSpy.mock.calls.flat().join('\n');
+    } finally {
+      logSpy.mockRestore();
+    }
+
+    expect(output).not.toContain('secret-token');
+    expect(output).toContain('[AWS_SECRET_REDACTED] description');
+    expect(output).toContain('[AWS_SECRET_REDACTED] error');
   });
 });

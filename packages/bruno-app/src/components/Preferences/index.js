@@ -11,7 +11,9 @@ import {
   IconZoomQuestion,
   IconSquareLetterB,
   IconDatabase,
-  IconCertificate
+  IconCertificate,
+  IconBrandGitlab,
+  IconCloudLock
 } from '@tabler/icons';
 
 import IconSparkles from 'components/Icons/IconSparkles';
@@ -23,6 +25,8 @@ import Display from './Display';
 import Keybindings from './Keybindings';
 import Beta from './Beta';
 import AI from './AI';
+import GitProviders from './GitProviders';
+import SecretManagers from './SecretManagers';
 
 import ClientCertSettings from './ClientCertSettings';
 
@@ -84,6 +88,14 @@ const Preferences = () => {
       case 'clientCert': {
         return <ClientCertSettings />;
       }
+
+      case 'gitProviders': {
+        return <GitProviders />;
+      }
+
+      case 'secretManagers': {
+        return <SecretManagers />;
+      }
     }
   };
 
@@ -110,6 +122,14 @@ const Preferences = () => {
           <div className={getTabClassname('clientCert')} role="tab" onClick={() => setTab('clientCert')}>
             <IconCertificate size={16} strokeWidth={1.5} />
             Client Certificates
+          </div>
+          <div className={getTabClassname('gitProviders')} role="tab" onClick={() => setTab('gitProviders')}>
+            <IconBrandGitlab size={16} strokeWidth={1.5} />
+            Git Providers
+          </div>
+          <div className={getTabClassname('secretManagers')} role="tab" onClick={() => setTab('secretManagers')}>
+            <IconCloudLock size={16} strokeWidth={1.5} />
+            Secret Managers
           </div>
           <div className={getTabClassname('keybindings')} role="tab" onClick={() => setTab('keybindings')}>
             <IconKeyboard size={16} strokeWidth={1.5} />

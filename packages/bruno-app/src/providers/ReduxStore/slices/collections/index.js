@@ -62,6 +62,43 @@ const deriveCollectionFormat = (brunoConfig) => {
   return brunoConfig?.opencollection ? 'yml' : brunoConfig?.format || 'bru';
 };
 
+const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj || {}, key);
+
+const normalizeProtectedNames = (protectedNames) =>
+  new Set((Array.isArray(protectedNames) ? protectedNames : []).filter((name) => typeof name === 'string' && name));
+
+const getEnabledVariableValue = (variables, name) => {
+  const variable = (variables || []).find((v) => v?.enabled && v.name === name);
+  return variable ? { found: true, value: variable.value } : { found: false };
+};
+
+const preserveProtectedScriptVars = (scriptVars, variables, protectedNames) => {
+  const next = { ...(scriptVars || {}) };
+  normalizeProtectedNames(protectedNames).forEach((name) => {
+    const current = getEnabledVariableValue(variables, name);
+    if (current.found) {
+      next[name] = current.value;
+      return;
+    }
+
+    delete next[name];
+  });
+  return next;
+};
+
+const preserveProtectedObjectValues = (nextVars, currentVars, protectedNames) => {
+  const next = { ...(nextVars || {}) };
+  normalizeProtectedNames(protectedNames).forEach((name) => {
+    if (hasOwn(currentVars, name)) {
+      next[name] = currentVars[name];
+      return;
+    }
+
+    delete next[name];
+  });
+  return next;
+};
+
 const mergeTreeItems = (existingItems, newItems) => {
   if (!Array.isArray(existingItems) || existingItems.length === 0) return newItems;
   const existingByUid = new Map();
@@ -416,6 +453,29 @@ export const collectionsSlice = createSlice({
         }
       }
     },
+    saveExternalSecrets: (state, action) => {
+      const { externalSecrets, environmentUid, collectionUid } = action.payload;
+      const collection = findCollectionByUid(state.collections, collectionUid);
+      const environment = collection && findEnvironmentInCollection(collection, environmentUid);
+      if (!environment) return;
+      environment.externalSecrets = externalSecrets || undefined;
+      // Keep a newer edit made while this save was pending.
+      if (collection.externalSecretsDrafts && JSON.stringify(collection.externalSecretsDrafts[environmentUid]) === JSON.stringify(externalSecrets)) {
+        delete collection.externalSecretsDrafts[environmentUid];
+      }
+    },
+    setExternalSecretsDraft: (state, action) => {
+      const { collectionUid, environmentUid, externalSecrets } = action.payload;
+      const collection = findCollectionByUid(state.collections, collectionUid);
+      if (!collection) return;
+      collection.externalSecretsDrafts = collection.externalSecretsDrafts || {};
+      collection.externalSecretsDrafts[environmentUid] = externalSecrets;
+    },
+    clearExternalSecretsDraft: (state, action) => {
+      const { collectionUid, environmentUid } = action.payload;
+      const collection = findCollectionByUid(state.collections, collectionUid);
+      if (collection?.externalSecretsDrafts) delete collection.externalSecretsDrafts[environmentUid];
+    },
     selectEnvironment: (state, action) => {
       const { environmentUid, collectionUid } = action.payload;
       const collection = findCollectionByUid(state.collections, collectionUid);
@@ -527,7 +587,7 @@ export const collectionsSlice = createSlice({
       }
     },
     scriptEnvironmentUpdateEvent: (state, action) => {
-      const { collectionUid, envVariables, requestUid } = action.payload;
+      const { collectionUid, envVariables, protectedNames } = action.payload;
       const collection = findCollectionByUid(state.collections, collectionUid);
 
       if (collection) {
@@ -540,6 +600,7 @@ export const collectionsSlice = createSlice({
           });
 
           const skipKeys = ['__name__'];
+          normalizeProtectedNames(protectedNames).forEach((name) => skipKeys.push(name));
 
           // add inherited variables names to `skipKeys` to avoid the `create new variable` path
           // except the variables whose values have been updated.
@@ -563,19 +624,25 @@ export const collectionsSlice = createSlice({
             collection.environmentsDraft = null;
           }
 
+          const effectiveEnvVariables = preserveProtectedScriptVars(
+            envVariables,
+            activeEnvironment.variables,
+            protectedNames
+          );
+
           activeEnvironment.variables = applyScriptEnvVars(
             activeEnvironment.variables,
-            envVariables,
+            effectiveEnvVariables,
             collection._scriptEnvBaseline,
             { skipKeys, inheritedVariables }
           );
 
           // Re-infer dataType only for vars the script actually modified — otherwise a no-op
           // script re-write would clobber a user's in-progress draft type change.
-          const modifiedKeys = getScriptModifiedKeys(envVariables, collection._scriptEnvBaseline, { skipKeys });
+          const modifiedKeys = getScriptModifiedKeys(effectiveEnvVariables, collection._scriptEnvBaseline, { skipKeys });
           activeEnvironment.variables.forEach((v) => {
             if (!modifiedKeys.has(v.name)) return;
-            const inferred = getDataTypeFromValue(envVariables[v.name]);
+            const inferred = getDataTypeFromValue(effectiveEnvVariables[v.name]);
             if (inferred === 'string') {
               delete v.dataType;
             } else {
@@ -586,10 +653,14 @@ export const collectionsSlice = createSlice({
       }
     },
     runtimeVariablesUpdateEvent: (state, action) => {
-      const { collectionUid, runtimeVariables } = action.payload;
+      const { collectionUid, runtimeVariables, protectedNames } = action.payload;
       const collection = findCollectionByUid(state.collections, collectionUid);
       if (collection) {
-        collection.runtimeVariables = runtimeVariables;
+        collection.runtimeVariables = preserveProtectedObjectValues(
+          runtimeVariables,
+          collection.runtimeVariables,
+          protectedNames
+        );
       }
     },
     processEnvUpdateEvent: (state, action) => {
@@ -4277,6 +4348,9 @@ export const {
   updatedFolderSettingsSelectedTab,
   collectionUnlinkEnvFileEvent,
   saveEnvironment,
+  saveExternalSecrets,
+  setExternalSecretsDraft,
+  clearExternalSecretsDraft,
   selectEnvironment,
   applyDefaultEnvironment,
   updateEnvironmentColor,

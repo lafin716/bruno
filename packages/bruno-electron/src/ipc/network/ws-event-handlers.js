@@ -22,6 +22,7 @@ const {
 const { interpolateString } = require('./interpolate-string');
 const path = require('node:path');
 const { setAuthHeaders } = require('./prepare-request');
+const { rejectAwsExternalSecretsForProtocol } = require('../../services/aws-secrets');
 
 const prepareWsRequest = async (item, collection, environment, runtimeVariables, certsAndProxyConfig = {}) => {
   const request = item.draft ? item.draft.request : item.request;
@@ -303,6 +304,7 @@ const registerWsEventHandlers = (window) => {
     'renderer:ws:start-connection',
     async (event, { request, collection, environment, runtimeVariables, settings, options = {} }) => {
       try {
+        rejectAwsExternalSecretsForProtocol(environment, 'WebSocket');
         const requestCopy = cloneDeep(request);
         const preparedRequest = await prepareWsRequest(requestCopy, collection, environment, runtimeVariables, {});
         const connectOnly = options?.connectOnly ?? false;
@@ -401,6 +403,7 @@ const registerWsEventHandlers = (window) => {
     'renderer:ws:queue-message',
     async (event, { item, collection, environment, runtimeVariables, selectedMessageIndex }) => {
       try {
+        rejectAwsExternalSecretsForProtocol(environment, 'WebSocket');
         const itemCopy = cloneDeep(item);
         const preparedRequest = await prepareWsRequest(itemCopy, collection, environment, runtimeVariables, {});
 

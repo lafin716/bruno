@@ -2,6 +2,29 @@ const { ipcMain } = require('electron');
 const { cloneGitRepository, getCollectionGitRepoUrl, listBranchesForRemoteUrl } = require('../utils/git');
 const { createDirectory, removeDirectory } = require('../utils/filesystem');
 
+const validateGitRepositoryUrl = (url) => {
+  const repositoryUrl = typeof url === 'string' ? url.trim() : '';
+  if (!repositoryUrl) {
+    throw new Error('Repository URL is required');
+  }
+  // git reads a dash-leading url as a command option, not a repository
+  if (repositoryUrl.startsWith('-')) {
+    throw new Error('Repository URL is not valid');
+  }
+
+  if (/^https?:\/\//i.test(repositoryUrl)) {
+    const parsed = new URL(repositoryUrl);
+    if (parsed.username || parsed.password) {
+      throw new Error('Repository URL must not include credentials');
+    }
+    if (parsed.search || parsed.hash) {
+      throw new Error('Repository URL must not include query parameters or fragments');
+    }
+  }
+
+  return repositoryUrl;
+};
+
 const getCollectionGitRemoteUrl = async (collectionPath) => {
   try {
     const url = await getCollectionGitRepoUrl(collectionPath);
@@ -12,25 +35,18 @@ const getCollectionGitRemoteUrl = async (collectionPath) => {
 };
 
 const handleListRemoteBranches = async (event, { url }) => {
-  const repositoryUrl = typeof url === 'string' ? url.trim() : '';
-  if (!repositoryUrl) {
-    throw new Error('Repository URL is required');
-  }
-  // git reads a dash-leading url as a command option, not a repository
-  if (repositoryUrl.startsWith('-')) {
-    throw new Error('Repository URL is not valid');
-  }
-
+  const repositoryUrl = validateGitRepositoryUrl(url);
   return listBranchesForRemoteUrl({ url: repositoryUrl });
 };
 
 const registerGitIpc = (mainWindow) => {
   ipcMain.handle('renderer:clone-git-repository', async (event, { url, path, processUid, branch }) => {
     let directoryCreated = false;
+    const repositoryUrl = validateGitRepositoryUrl(url);
     try {
       await createDirectory(path);
       directoryCreated = true;
-      await cloneGitRepository(mainWindow, { url, path, processUid, branch });
+      await cloneGitRepository(mainWindow, { url: repositoryUrl, path, processUid, branch });
       return 'Repository cloned successfully';
     } catch (error) {
       if (directoryCreated) {
@@ -50,3 +66,4 @@ const registerGitIpc = (mainWindow) => {
 module.exports = registerGitIpc;
 module.exports.getCollectionGitRemoteUrl = getCollectionGitRemoteUrl;
 module.exports.handleListRemoteBranches = handleListRemoteBranches;
+module.exports.validateGitRepositoryUrl = validateGitRepositoryUrl;
