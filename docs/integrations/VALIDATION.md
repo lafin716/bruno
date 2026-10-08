@@ -83,3 +83,7 @@ Real company GitLab and AWS access was not exercised because no nonproduction en
 The shared package build still emits preexisting Faker declaration warnings from the package's TypeScript 4.8 build, and converter prerequisite builds have preexisting type warnings. The new AWS module passes a separate strict TypeScript 5.8 check. No dependency or lockfile changes were made.
 
 See [SETUP.md](SETUP.md) for protocol support and certificate/credential requirements. AWS references currently support HTTP/GraphQL; gRPC/WebSocket are explicitly rejected. Live SSE content is hidden while AWS secrets are active. A script can deliberately transmit or transform a secret; output masking cannot provide protection against arbitrary script transformations.
+
+## Delivery
+
+Implementation commit `6ed3a78f041da1ef1c569405bbaae8f7d7b69273` was pushed to `origin/feat/gitlab-aws-secrets`. `git ls-remote --heads origin feat/gitlab-aws-secrets` returned the same SHA. The commit hook passed and left the validated staging tree unchanged (`092e7d524dafac5ef4a5616397d8a79efe9678ea`). The worktree was clean after commit. The original workspace remained clean on `main` at the initial source revision. This completed validation/progress record is delivered as a documentation follow-up commit.
