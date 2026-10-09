@@ -26,9 +26,7 @@ const { getOAuth2Token, getFormattedOauth2Credentials } = require('../utils/oaut
 const tokenStore = require('../store/tokenStore');
 const { encodeUrl, buildFormUrlEncodedPayload, extractPromptVariables, isFormData, getMediaType, extractBoundaryFromContentType, hasExplicitScheme, DEFAULT_MAX_REDIRECTS } = require('@usebruno/common').utils;
 
-const onConsoleLog = (type, args) => {
-  console[type](...args);
-};
+const defaultRedactor = (value) => value;
 
 const getCACertHostRegex = (domain) => {
   return '^https:\\/\\/' + domain.replaceAll('.', '\\.').replaceAll('*', '.*');
@@ -116,6 +114,10 @@ const runSingleRequest = async function (
   persistPaths = {},
   runAbortSignal = null
 ) {
+  const redact = typeof persistPaths.redactor === 'function' ? persistPaths.redactor : defaultRedactor;
+  const onConsoleLog = (type, args) => {
+    console[type](...redact(args || []));
+  };
   const syncVariableUpdates = (result, currentRequest) => {
     if (!result) return;
     applyVariableUpdates(result, {
@@ -133,7 +135,9 @@ const runSingleRequest = async function (
         collection,
         collectionRootPath: persistPaths.collectionRootPath,
         envVarOverrides: persistPaths.envVarOverrides,
-        globalEnvVarOverrides: persistPaths.globalEnvVarOverrides
+        globalEnvVarOverrides: persistPaths.globalEnvVarOverrides,
+        protectedNames: persistPaths.protectedNames,
+        protectedValues: persistPaths.protectedValues
       });
     } catch (err) {
       console.warn(chalk.yellow(`Warning: failed to persist variable updates: ${err.message}`));
@@ -148,7 +152,7 @@ const runSingleRequest = async function (
         console.log(chalk.dim(title));
       }
       each(results, (r) => {
-        const message = r.description || `${r.lhsExpr}: ${r.rhsExpr}`;
+        const message = redact(r.description || `${r.lhsExpr}: ${r.rhsExpr}`);
         if (r.status === 'pass') {
           console.log(chalk.green(`   ✓ `) + chalk.dim(message));
         } else {
@@ -163,9 +167,9 @@ const runSingleRequest = async function (
               : scriptType === SCRIPT_TYPES.POST_RESPONSE ? request?.script?.resMetadata
                 : scriptType === SCRIPT_TYPES.TEST ? request?.testsMetadata
                   : null;
-            console.log('\n' + formatErrorWithContext(errorObj, relativeItemPathname, scriptType, 5, metadata) + '\n');
+            console.log('\n' + redact(formatErrorWithContext(errorObj, relativeItemPathname, scriptType, 5, metadata)) + '\n');
           } else if (r.error) {
-            console.log(chalk.red(`      ${r.error}`));
+            console.log(chalk.red(`      ${redact(r.error)}`));
           }
         }
       });
@@ -189,7 +193,7 @@ const runSingleRequest = async function (
 
     if (promptVars.length > 0) {
       const errorMsg = `Prompt variables detected in request. CLI execution is not supported for requests with prompt variables. \nPrompts: ${promptVars.join(', ')}`;
-      console.log(chalk.yellow(stripExtension(relativeItemPathname) + ' Skipped:') + chalk.dim(` (${errorMsg})`));
+      console.log(chalk.yellow(stripExtension(relativeItemPathname) + ' Skipped:') + chalk.dim(` (${redact(errorMsg)})`));
       return {
         test: {
           filename: relativeItemPathname
@@ -322,7 +326,7 @@ const runSingleRequest = async function (
       } catch (error) {
         // Pre-request errors are treated as request errors (we return early with status: 'error'), not as failures. Unlike post-response and test script errors, we do not add a synthetic fail and continue.
         console.error(chalk.red(`[${relativeItemPathname}] Pre-request script error:`));
-        console.log('\n' + formatErrorWithContext(error, relativeItemPathname, SCRIPT_TYPES.PRE_REQUEST, 5, request.script?.reqMetadata) + '\n');
+        console.log('\n' + redact(formatErrorWithContext(error, relativeItemPathname, SCRIPT_TYPES.PRE_REQUEST, 5, request.script?.reqMetadata)) + '\n');
 
         // Extract partial results from the error (tests that passed before the error)
         preRequestTestResults = error?.partialResults?.results || [];
@@ -363,7 +367,7 @@ const runSingleRequest = async function (
             duration: 0,
             size: 0
           },
-          error: error?.message || 'An error occurred while executing the pre-request script.',
+          error: redact(error?.message || 'An error occurred while executing the pre-request script.'),
           status: 'error',
           assertionResults: [],
           testResults: [],
@@ -663,12 +667,12 @@ const runSingleRequest = async function (
               url.searchParams.set(tokenQueryKey, token);
               request.url = url.toString();
             } catch (error) {
-              console.error('Error applying OAuth2 token to URL:', error.message);
+              console.error('Error applying OAuth2 token to URL:', redact(error.message));
             }
           }
         }
       } catch (error) {
-        console.error('OAuth2 token fetch error:', error.message);
+        console.error('OAuth2 token fetch error:', redact(error.message));
       }
 
       request.oauth2CredentialVariables = getFormattedOauth2Credentials();
@@ -774,7 +778,7 @@ const runSingleRequest = async function (
         const onFailResult = await executeRequestOnFailHandler(request, err);
         syncVariableUpdates(onFailResult, request);
 
-        console.log(chalk.red(stripExtension(relativeItemPathname)) + chalk.dim(` (${err.message})`));
+        console.log(chalk.red(stripExtension(relativeItemPathname)) + chalk.dim(` (${redact(err.message)})`));
         applySentHeadersToRequest(request, err);
         return {
           test: {
@@ -796,7 +800,7 @@ const runSingleRequest = async function (
             duration: 0,
             size: 0
           },
-          error: err?.message || err?.errors?.map((e) => e?.message)?.at(0) || err?.code || 'Request Failed!',
+          error: redact(err?.message || err?.errors?.map((e) => e?.message)?.at(0) || err?.code || 'Request Failed!'),
           status: 'error',
           assertionResults: [],
           testResults: [],
@@ -874,7 +878,7 @@ const runSingleRequest = async function (
         logResults(postResponseTestResults, 'Post-Response Tests', SCRIPT_TYPES.POST_RESPONSE, request);
       } catch (error) {
         console.error(chalk.red(`[${relativeItemPathname}] Post-response script error:`));
-        console.log('\n' + formatErrorWithContext(error, relativeItemPathname, SCRIPT_TYPES.POST_RESPONSE, 5, request.script?.resMetadata) + '\n');
+        console.log('\n' + redact(formatErrorWithContext(error, relativeItemPathname, SCRIPT_TYPES.POST_RESPONSE, 5, request.script?.resMetadata)) + '\n');
 
         const partialResults = error?.partialResults?.results || [];
         postResponseTestResults = [
@@ -882,7 +886,7 @@ const runSingleRequest = async function (
           {
             status: 'fail',
             description: 'Post-Response Script Error',
-            error: error.message || 'An error occurred while executing the post-response script.',
+            error: redact(error.message || 'An error occurred while executing the post-response script.'),
             isScriptError: true
           }
         ];
@@ -954,7 +958,7 @@ const runSingleRequest = async function (
         logResults(testResults, 'Tests', SCRIPT_TYPES.TEST, request);
       } catch (error) {
         console.error(chalk.red(`[${relativeItemPathname}] Test script error:`));
-        console.log('\n' + formatErrorWithContext(error, relativeItemPathname, SCRIPT_TYPES.TEST, 5, request.testsMetadata) + '\n');
+        console.log('\n' + redact(formatErrorWithContext(error, relativeItemPathname, SCRIPT_TYPES.TEST, 5, request.testsMetadata)) + '\n');
 
         const partialResults = error?.partialResults?.results || [];
         testResults = [
@@ -962,7 +966,7 @@ const runSingleRequest = async function (
           {
             status: 'fail',
             description: 'Test Script Error',
-            error: error.message || 'An error occurred while executing the test script.',
+            error: redact(error.message || 'An error occurred while executing the test script.'),
             isScriptError: true
           }
         ];
@@ -1013,7 +1017,7 @@ const runSingleRequest = async function (
       shouldStopRunnerExecution
     };
   } catch (err) {
-    console.log(chalk.red(stripExtension(relativeItemPathname)) + chalk.dim(` (${err.message})`));
+    console.log(chalk.red(stripExtension(relativeItemPathname)) + chalk.dim(` (${redact(err.message)})`));
     return {
       test: {
         filename: relativeItemPathname
@@ -1035,7 +1039,7 @@ const runSingleRequest = async function (
         size: 0
       },
       status: 'error',
-      error: err.message,
+      error: redact(err.message),
       assertionResults: [],
       testResults: [],
       preRequestTestResults: [],

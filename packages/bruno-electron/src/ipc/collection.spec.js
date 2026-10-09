@@ -27,6 +27,7 @@ jest.mock('electron', () => {
 jest.mock('../utils/filesystem', () => ({
   ...jest.requireActual('../utils/filesystem'),
   copyPathTo: jest.fn(),
+  writeFile: jest.fn(async () => {}),
   removePath: jest.fn(),
   getPaths: jest.fn(async (src) => [src]),
   withDirLock: jest.fn((dir, cb) => cb()),
@@ -56,7 +57,9 @@ jest.mock('../app/collection-watcher', () => {
 
 jest.mock('@usebruno/filestore', () => ({
   parseRequest: jest.fn(() => ({})),
-  stringifyRequest: jest.fn(() => 'mock-content-stringified')
+  stringifyRequest: jest.fn(() => 'mock-content-stringified'),
+  parseEnvironment: jest.fn(),
+  stringifyEnvironment: jest.fn()
 }));
 
 const fsPromises = require('node:fs').promises;
@@ -73,6 +76,24 @@ describe('IPC collection handlers', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     registerCollectionsIpc({}, {});
+  });
+
+  it('preserves references from disk when an ordinary variable save has a stale snapshot', async () => {
+    const { parseEnvironment, stringifyEnvironment } = require('@usebruno/filestore');
+    const references = { type: 'aws-secrets-manager', variables: [{ name: 'TOKEN', value: '{"secretId":"new/reference"}' }] };
+    jest.spyOn(fs, 'existsSync').mockReturnValue(true);
+    const existsSpy = jest.spyOn(require('fs-extra'), 'existsSync').mockReturnValue(true);
+    const readSpy = jest.spyOn(fs, 'readFileSync').mockReturnValue('latest-environment');
+    parseEnvironment.mockReturnValue({ name: 'dev', variables: [], externalSecrets: references });
+    stringifyEnvironment.mockImplementation((environment) => JSON.stringify(environment));
+    const staleEnvironment = { name: 'dev', variables: [{ name: 'HOST', value: 'edited', enabled: true, secret: false }] };
+    await ipcMain._getHandler('renderer:save-environment')({}, path.join(os.tmpdir(), 'fake', 'source'), staleEnvironment);
+    expect(stringifyEnvironment).toHaveBeenCalledWith(expect.objectContaining({
+      externalSecrets: references,
+      variables: staleEnvironment.variables
+    }), { format: 'yml' });
+    readSpy.mockRestore();
+    existsSpy.mockRestore();
   });
 
   describe('renderer:move-item', () => {

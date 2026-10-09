@@ -72,6 +72,24 @@ const stripInternal = (vars) => {
   return out;
 };
 
+const asSet = (value) => {
+  if (value instanceof Set) return value;
+  if (Array.isArray(value)) return new Set(value);
+  return new Set();
+};
+
+const containsProtectedValue = (value, protectedValues) => {
+  if (!protectedValues.size || value === undefined || value === null) return false;
+  const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+  if (typeof serialized !== 'string') return false;
+  for (const secretValue of protectedValues) {
+    if (typeof secretValue === 'string' && secretValue.length && serialized.includes(secretValue)) {
+      return true;
+    }
+  }
+  return false;
+};
+
 /**
  * In-place replace of `target`'s contents with `source`'s, while preserving `target.__name__`.
  * Callers hold long-lived references to `target`, so a fresh object would not propagate.
@@ -206,6 +224,8 @@ const applyVariableUpdates = (result, { envVariables, runtimeVariables, globalEn
  */
 const mergeScriptVarsIntoEnvList = (variables, scriptVarsRaw, options = {}) => {
   const overrides = options.overrides instanceof Map ? options.overrides : new Map();
+  const protectedNames = asSet(options.protectedNames);
+  const protectedValues = asSet(options.protectedValues);
   const scriptVars = stripInternal(scriptVarsRaw);
   const scriptVarsKeys = new Set(Object.keys(scriptVars));
   // These names belong to another environment source (an `extends` parent, or an `--env-file`
@@ -221,6 +241,11 @@ const mergeScriptVarsIntoEnvList = (variables, scriptVarsRaw, options = {}) => {
       delete scriptVars[key];
     }
   }
+  for (const key of Object.keys(scriptVars)) {
+    if (protectedNames.has(key) || containsProtectedValue(scriptVars[key], protectedValues)) {
+      delete scriptVars[key];
+    }
+  }
   const scriptKeys = new Set(Object.keys(scriptVars));
   // A rotated secret from another environment file lands here as an override; as a plain row its
   // value would reach disk in cleartext, so that file's secret flag has to come with it.
@@ -231,12 +256,14 @@ const mergeScriptVarsIntoEnvList = (variables, scriptVarsRaw, options = {}) => {
   const next = (variables || [])
     .filter((v) => {
       if (v.enabled === false) return true;
+      if (protectedNames.has(v.name)) return true;
       if (scriptVarsKeys.has(v.name)) return true;
       // Keep the file's entry for an overridden name even if the script didn't echo it back.
       if (overrides.has(v.name)) return true;
       return false;
     })
     .map((v) => {
+      if (protectedNames.has(v.name)) return v;
       if (v.enabled === false || !scriptKeys.has(v.name)) return v;
       // A plain row of the same name shadows the other file's secret rather than replacing it, so
       // the rotated value would otherwise land on that plain row and reach disk in cleartext. The
@@ -289,20 +316,33 @@ const mergeScriptVarsIntoEnvList = (variables, scriptVarsRaw, options = {}) => {
  *     { name: 'retries', value: 3,    enabled: true, type: 'request', dataType: 'number' }
  *   ]
  */
-const mergeScriptVarsIntoCollectionVarsList = (variables, scriptVars) => {
-  const scriptKeys = new Set(Object.keys(scriptVars || {}));
+const mergeScriptVarsIntoCollectionVarsList = (variables, scriptVars, options = {}) => {
+  const protectedNames = asSet(options.protectedNames);
+  const protectedValues = asSet(options.protectedValues);
+  const filteredScriptVars = { ...(scriptVars || {}) };
+  for (const key of Object.keys(filteredScriptVars)) {
+    if (protectedNames.has(key) || containsProtectedValue(filteredScriptVars[key], protectedValues)) {
+      delete filteredScriptVars[key];
+    }
+  }
+  const scriptKeys = new Set(Object.keys(filteredScriptVars));
   const next = (variables || [])
-    .filter((v) => (v.enabled === false ? true : scriptKeys.has(v.name)))
+    .filter((v) => {
+      if (v.enabled === false) return true;
+      if (protectedNames.has(v.name)) return true;
+      return scriptKeys.has(v.name);
+    })
     .map((v) => {
+      if (protectedNames.has(v.name)) return v;
       if (v.enabled === false || !scriptKeys.has(v.name)) return v;
-      return applyInferredDataType({ ...v, value: scriptVars[v.name] }, scriptVars[v.name]);
+      return applyInferredDataType({ ...v, value: filteredScriptVars[v.name] }, filteredScriptVars[v.name]);
     });
 
   const presentEnabled = new Set(next.filter((v) => v.enabled !== false).map((v) => v.name));
   for (const key of scriptKeys) {
     if (presentEnabled.has(key)) continue;
-    const entry = { name: key, value: scriptVars[key], type: 'request', enabled: true };
-    next.push(applyInferredDataType(entry, scriptVars[key]));
+    const entry = { name: key, value: filteredScriptVars[key], type: 'request', enabled: true };
+    next.push(applyInferredDataType(entry, filteredScriptVars[key]));
   }
   return next;
 };
@@ -439,13 +479,13 @@ const persistEnvFile = (envFile, scriptVars, options = {}) => {
  *   ]
  * -> `collection.bru` on disk is rewritten with the same content.
  */
-const persistCollectionVars = (collection, scriptCollVars, collectionRootPath) => {
+const persistCollectionVars = (collection, scriptCollVars, collectionRootPath, options = {}) => {
   if (!collection || !collectionRootPath) return;
   const collectionRoot = collection.root || {};
   collectionRoot.request = collectionRoot.request || {};
   collectionRoot.request.vars = collectionRoot.request.vars || {};
   const existingVars = collectionRoot.request.vars.req || [];
-  const merged = mergeScriptVarsIntoCollectionVarsList(existingVars, scriptCollVars);
+  const merged = mergeScriptVarsIntoCollectionVarsList(existingVars, scriptCollVars, options);
   collectionRoot.request.vars.req = merged;
   collection.root = collectionRoot;
 
@@ -496,16 +536,17 @@ const persistCollectionVars = (collection, scriptCollVars, collectionRootPath) =
  * persistVariableUpdates(result, { envFile, globalEnvFile, collection, collectionRootPath });
  * -> writes `token: abc` into the active env file and `region: eu` into the collection root file.
  */
-const persistVariableUpdates = (result, { envFile, globalEnvFile, collection, collectionRootPath, envVarOverrides, globalEnvVarOverrides }) => {
+const persistVariableUpdates = (result, { envFile, globalEnvFile, collection, collectionRootPath, envVarOverrides, globalEnvVarOverrides, protectedNames, protectedValues }) => {
   if (!result) return;
-  const envOpts = envVarOverrides ? { overrides: envVarOverrides } : undefined;
+  const commonProtectOptions = { protectedNames, protectedValues };
+  const envOpts = { ...(envVarOverrides ? { overrides: envVarOverrides } : {}), ...commonProtectOptions };
   if (result.envVariables) persistEnvFile(envFile, result.envVariables, envOpts);
   // Global env file gets its own leak-guard, seeded from `--global-env-var` overrides: a value
   // injected via the CLI and passed through unchanged never reaches the .yml, but a deliberate
   // `bru.setGlobalEnvVar` write of a different value still persists.
-  const globalEnvOpts = globalEnvVarOverrides ? { overrides: globalEnvVarOverrides } : undefined;
+  const globalEnvOpts = { ...(globalEnvVarOverrides ? { overrides: globalEnvVarOverrides } : {}), ...commonProtectOptions };
   if (result.globalEnvironmentVariables) persistEnvFile(globalEnvFile, result.globalEnvironmentVariables, globalEnvOpts);
-  if (result.collectionVariables) persistCollectionVars(collection, result.collectionVariables, collectionRootPath);
+  if (result.collectionVariables) persistCollectionVars(collection, result.collectionVariables, collectionRootPath, commonProtectOptions);
 };
 
 module.exports = {

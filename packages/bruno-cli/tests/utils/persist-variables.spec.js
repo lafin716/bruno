@@ -87,6 +87,22 @@ describe('mergeScriptVarsIntoCollectionVarsList', () => {
     expect(byName.disabled).toBeDefined();
     expect(byName.gone).toBeUndefined();
   });
+
+  it('keeps AWS protected names and copied values out of collection vars', () => {
+    const variables = [
+      { name: 'TOKEN', value: 'old', enabled: true, type: 'request' },
+      { name: 'keep', value: '1', enabled: true, type: 'request' }
+    ];
+    const merged = mergeScriptVarsIntoCollectionVarsList(
+      variables,
+      { TOKEN: 'secret', keep: '2', copied: 'prefix-secret-suffix' },
+      { protectedNames: new Set(['TOKEN']), protectedValues: new Set(['secret']) }
+    );
+    const byName = Object.fromEntries(merged.map((v) => [v.name, v]));
+    expect(byName.TOKEN.value).toBe('old');
+    expect(byName.keep.value).toBe('2');
+    expect(byName.copied).toBeUndefined();
+  });
 });
 
 describe('applyVariableUpdates', () => {
@@ -125,6 +141,25 @@ describe('applyVariableUpdates', () => {
 });
 
 describe('persistVariableUpdates — env file', () => {
+  it('preserves AWS external names and copied values during writeback', () => {
+    const filePath = writeFile('dev.yml',
+      'name: dev\nvariables:\n  - name: TOKEN\n    value: old\n  - name: host\n    value: old-host\n'
+    );
+    persistVariableUpdates(
+      { envVariables: { TOKEN: 'secret', host: 'new-host', copied: 'prefix-secret-suffix', __name__: 'dev' } },
+      {
+        envFile: { path: filePath, format: 'yml' },
+        protectedNames: new Set(['TOKEN']),
+        protectedValues: new Set(['secret'])
+      }
+    );
+    const written = fs.readFileSync(filePath, 'utf8');
+    expect(written).toMatch(/TOKEN/);
+    expect(written).toMatch(/old/);
+    expect(written).toMatch(/new-host/);
+    expect(written).not.toMatch(/prefix-secret-suffix/);
+  });
+
   it('round-trips a yml env file', () => {
     const filePath = writeFile('dev.yml',
       'name: dev\nvariables:\n  - name: host\n    value: old\n  - name: token\n    value: keep\n'

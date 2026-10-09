@@ -15,6 +15,7 @@ const { getPacResolver } = require('@usebruno/requests');
 const { getBrunoConfig } = require('../../store/bruno-config');
 const { getJsSandboxRuntime } = require('../../utils/collection');
 const { createGrpcScriptOrchestration } = require('./grpc-script-orchestration');
+const { rejectAwsExternalSecretsForProtocol } = require('../../services/aws-secrets');
 
 // Creating grpcClient at module level so it can be accessed from window-all-closed event
 let grpcClient;
@@ -162,6 +163,7 @@ const registerGrpcEventHandlers = (window) => {
   // Start a new gRPC connection
   ipcMain.handle('grpc:start-connection', async (event, { request, collection, environment, runtimeVariables }) => {
     try {
+      rejectAwsExternalSecretsForProtocol(environment, 'gRPC');
       const requestCopy = cloneDeep(request);
       const preparedRequest = await buildGrpcRequest(requestCopy, collection, environment, runtimeVariables, {});
 

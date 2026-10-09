@@ -66,6 +66,20 @@ const renderModal = ({ apiSpecs = [], tabs = [], collections = [], forceCloseTab
 };
 
 describe('the unsaved changes dialog shown while quitting', () => {
+  it('lists and saves external references when closing the environment tab', async () => {
+    const externalSecrets = { type: 'aws-secrets-manager', variables: [{ name: 'TOKEN', value: '{"secretId":"dev/api"}' }] };
+    const { onClose } = renderModal({
+      collections: [{ uid: 'c', pathname: '/collection', environments: [{ uid: 'e', name: 'dev', variables: [] }], items: [], externalSecretsDrafts: { e: externalSecrets } }],
+      tabs: [{ uid: 'env-tab', collectionUid: 'c', type: 'environment-settings' }],
+      forceCloseTabs: true,
+      tabUidsToClose: ['env-tab']
+    });
+    expect(screen.getByText('External Secrets: dev (AWS secret references)')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(window.ipcRenderer.invoke).toHaveBeenCalledWith('renderer:save-external-secrets', '/collection', 'dev', externalSecrets));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+  });
+
   it('lists an API spec that has edits the user has not saved', () => {
     renderModal({
       apiSpecs: [{ uid: 'spec-1', name: 'Petstore', pathname: SPEC_PATHNAME, raw: 'openapi: 3.0.0', draft: 'openapi: 3.1.0' }],

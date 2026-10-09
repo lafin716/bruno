@@ -86,6 +86,7 @@ const { REQUEST_TYPES } = require('../utils/constants');
 const { cancelOAuth2AuthorizationRequest, isOauth2AuthorizationRequestInProgress } = require('../utils/oauth2-protocol-handler');
 const { findUniqueFolderName } = require('../utils/collection-import');
 const { renameEnvironmentExtendsReferences } = require('../utils/environments');
+const { saveExternalSecrets } = require('../services/save-external-secrets');
 const { saveSpecAndUpdateMetadata, cleanupSpecFilesForCollection } = require('./openapi-sync');
 const {
   validateWorkspacePath,
@@ -788,6 +789,10 @@ const registerRendererEventHandlers = (mainWindow, watcher) => {
   });
 
   // save environment
+  ipcMain.handle('renderer:save-external-secrets', (_event, collectionPathname, environmentName, externalSecrets) =>
+    saveExternalSecrets(collectionPathname, environmentName, externalSecrets)
+  );
+
   ipcMain.handle('renderer:save-environment', async (event, collectionPathname, environment) => {
     try {
       const format = getCollectionFormat(collectionPathname);
@@ -808,12 +813,16 @@ const registerRendererEventHandlers = (mainWindow, watcher) => {
       // dropping B's update. Rapid scripted `bru.setEnvVar(..., {persist:true})`
       // calls (e.g. across folder-run requests) hit this without serialization.
       await withFileLock(envFilePath, async () => {
+        const existing = fs.readFileSync(envFilePath, 'utf8');
+        // References have their own save path. Ordinary variable saves must not
+        // restore a stale reference snapshot while a separate editor saves it.
+        const latestEnvironment = parseEnvironment(existing, { format });
+        environment.externalSecrets = latestEnvironment.externalSecrets;
         if (envHasSecrets(environment)) {
           environmentSecretsStore.storeEnvSecrets(collectionPathname, environment);
         }
 
         const content = await stringifyEnvironment(environment, { format });
-        const existing = fs.readFileSync(envFilePath, 'utf8');
         if (content === existing) return; // skip write if content unchanged
         await writeFile(envFilePath, content);
       });

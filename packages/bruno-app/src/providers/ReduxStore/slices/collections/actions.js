@@ -60,6 +60,7 @@ import {
   updateActiveConnections,
   saveRequest as _saveRequest,
   saveEnvironment as _saveEnvironment,
+  saveExternalSecrets as _saveExternalSecrets,
   saveEnvironmentExtends as _saveEnvironmentExtends,
   updateEnvironmentColor as _updateEnvironmentColor,
   saveCollectionDraft,
@@ -117,6 +118,28 @@ import {
   hydrateCollectionTabs,
   hydrateSnapshotLookups
 } from 'utils/snapshot';
+
+const normalizeProtectedNames = (protectedNames) =>
+  new Set((Array.isArray(protectedNames) ? protectedNames : []).filter((name) => typeof name === 'string' && name));
+
+const getEnabledVariableValue = (variables, name) => {
+  const variable = (variables || []).find((v) => v?.enabled && v.name === name);
+  return variable ? { found: true, value: variable.value } : { found: false };
+};
+
+const preserveProtectedScriptVars = (scriptVars, variables, protectedNames) => {
+  const next = { ...(scriptVars || {}) };
+  normalizeProtectedNames(protectedNames).forEach((name) => {
+    const current = getEnabledVariableValue(variables, name);
+    if (current.found) {
+      next[name] = current.value;
+      return;
+    }
+
+    delete next[name];
+  });
+  return next;
+};
 
 // Display name for a cloned/pasted item: always "<source> copy" (semantic).
 // Filename uniqueness is resolved silently by the electron main process
@@ -2234,6 +2257,15 @@ export const saveEnvironment = (variables, environmentUid, collectionUid) => (di
   });
 };
 
+export const saveExternalSecrets = (externalSecrets, environmentUid, collectionUid) => async (dispatch, getState) => {
+  const collection = findCollectionByUid(getState().collections.collections, collectionUid);
+  const environment = collection && findEnvironmentInCollection(collection, environmentUid);
+  if (!environment) throw new Error('Environment not found');
+  const references = cloneDeep(externalSecrets);
+  await window.ipcRenderer.invoke('renderer:save-external-secrets', collection.pathname, environment.name, references);
+  dispatch(_saveExternalSecrets({ externalSecrets: references, environmentUid, collectionUid }));
+};
+
 export const updateEnvironmentColor = (environmentUid, color, collectionUid) => (dispatch, getState) => {
   return new Promise((resolve, reject) => {
     const state = getState();
@@ -2580,7 +2612,7 @@ export const persistActiveEnvironment = (collectionUid) => (dispatch, getState) 
     .catch((err) => console.error('Failed to persist environment during script execution:', err));
 };
 
-export const collectionVariablesUpdateEvent = ({ collectionVariables, collectionUid }) => (dispatch, getState) => {
+export const collectionVariablesUpdateEvent = ({ collectionVariables, collectionUid, protectedNames }) => (dispatch, getState) => {
   if (!collectionVariables || !collectionUid) return;
 
   const state = getState();
@@ -2603,16 +2635,18 @@ export const collectionVariablesUpdateEvent = ({ collectionVariables, collection
   }
 
   let vars = cloneDeep(draftVars || savedVars);
+  const protectedSkipKeys = [...normalizeProtectedNames(protectedNames)];
+  const effectiveCollectionVariables = preserveProtectedScriptVars(collectionVariables, vars, protectedNames);
 
-  vars = applyScriptEnvVars(vars, collectionVariables, baseline);
+  vars = applyScriptEnvVars(vars, effectiveCollectionVariables, baseline, { skipKeys: protectedSkipKeys });
 
   // Re-infer dataType only for vars the script actually modified; baseline-mode no-op writes
   // must NOT overwrite a user's in-progress draft type change.
-  const modifiedKeys = getScriptModifiedKeys(collectionVariables, baseline);
+  const modifiedKeys = getScriptModifiedKeys(effectiveCollectionVariables, baseline, { skipKeys: protectedSkipKeys });
   modifiedKeys.forEach((name) => {
     const existing = vars.find((v) => v.name === name);
     if (!existing) return;
-    const inferred = getDataTypeFromValue(collectionVariables[name]);
+    const inferred = getDataTypeFromValue(effectiveCollectionVariables[name]);
     if (inferred === 'string') {
       delete existing.dataType;
     } else {

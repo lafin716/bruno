@@ -1,7 +1,7 @@
 const https = require('https');
 const axios = require('axios');
 const path = require('path');
-const { applyOAuth1ToRequest } = require('@usebruno/requests');
+const { applyOAuth1ToRequest, createAwsSecretRedactor } = require('@usebruno/requests');
 const { buildScriptedEntry } = require('@usebruno/requests').scripting;
 const qs = require('qs');
 const decomment = require('decomment');
@@ -47,19 +47,134 @@ const { getCertsAndProxyConfig, buildCertsAndProxyConfig } = require('./cert-uti
 const { easterEggResponse } = require('../../utils/woof');
 const { createRunnerExchangeEmitters } = require('./runner-exchange');
 const { saveRunnerResponseBody } = require('../../services/runner-exchange');
+const { resolveDesktopAwsExternalSecrets } = require('../../services/aws-secrets');
 const { buildFormUrlEncodedPayload, isFormData, getMediaType, extractBoundaryFromContentType } = require('@usebruno/common').utils;
 
 const ERROR_OCCURRED_WHILE_EXECUTING_REQUEST = 'Error occurred while executing the request!';
+const awsSecretsByCollection = new WeakMap();
 
-const saveCookies = (url, headers) => {
+const resolveAwsSecretsForEnvironment = async ({ collection, environment, envVars }) => {
+  const externalSecrets = environment?.externalSecrets;
+  if (externalSecrets?.type !== 'aws-secrets-manager' || externalSecrets.variables == null) {
+    const empty = { variables: {}, secretNames: new Set(), secretValues: new Set(), originalEnvVars: { ...envVars } };
+    awsSecretsByCollection.set(collection, empty);
+    return envVars;
+  }
+
+  const resolved = await resolveDesktopAwsExternalSecrets(externalSecrets);
+  awsSecretsByCollection.set(collection, { ...resolved, originalEnvVars: { ...envVars } });
+  return {
+    ...envVars,
+    ...resolved.variables
+  };
+};
+
+const containsProtectedAwsValue = (value, protectedValues) => {
+  if (!protectedValues?.size || value === undefined || value === null) return false;
+  const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+  if (typeof serialized !== 'string') return false;
+  for (const secretValue of protectedValues) {
+    if (typeof secretValue === 'string' && secretValue.length && serialized.includes(secretValue)) {
+      return true;
+    }
+  }
+  return false;
+};
+
+const filterAwsProtectedVariables = (variables, awsSecrets, baselineVariables = {}) => {
+  if (!variables || (!awsSecrets?.secretNames?.size && !awsSecrets?.secretValues?.size)) {
+    return { variables, protectedNames: [] };
+  }
+  const next = {};
+  const protectedNames = new Set(awsSecrets.secretNames || []);
+  const canRestoreBaseline = (name) => (
+    Object.prototype.hasOwnProperty.call(baselineVariables, name)
+    && !containsProtectedAwsValue(baselineVariables[name], awsSecrets.secretValues)
+  );
+
+  for (const [name, value] of Object.entries(variables)) {
+    if (awsSecrets.secretNames?.has(name) || containsProtectedAwsValue(value, awsSecrets.secretValues)) {
+      protectedNames.add(name);
+      if (canRestoreBaseline(name)) {
+        next[name] = baselineVariables[name];
+      }
+      continue;
+    }
+    next[name] = value;
+  }
+
+  for (const name of awsSecrets.secretNames || []) {
+    if (!Object.prototype.hasOwnProperty.call(next, name) && canRestoreBaseline(name)) {
+      next[name] = baselineVariables[name];
+    }
+  }
+
+  return { variables: next, protectedNames: Array.from(protectedNames) };
+};
+
+const hasAwsProtectedOutput = (collection) => {
+  const awsSecrets = awsSecretsByCollection.get(collection);
+  return Boolean(awsSecrets?.secretValues?.size || awsSecrets?.secretNames?.size);
+};
+
+const redactAwsOutput = (collection, value) => {
+  const awsSecrets = awsSecretsByCollection.get(collection);
+  return createAwsSecretRedactor(awsSecrets?.secretValues)(value);
+};
+
+const redactAwsStreamChunk = (collection, parsed) => {
+  if (!hasAwsProtectedOutput(collection)) {
+    return redactAwsOutput(collection, parsed);
+  }
+  return {
+    ...parsed,
+    data: '[AWS_SECRET_REDACTED]',
+    dataBuffer: Buffer.from('[AWS_SECRET_REDACTED]')
+  };
+};
+
+const buildOauth2CredentialsEventPayload = ({ collection, oauth2Credentials, collectionUid, itemUid, executionMode }) => redactAwsOutput(collection, {
+  credentials: oauth2Credentials?.credentials,
+  url: oauth2Credentials?.url,
+  collectionUid,
+  credentialsId: oauth2Credentials?.credentialsId,
+  ...(oauth2Credentials?.folderUid ? { folderUid: oauth2Credentials.folderUid } : { itemUid }),
+  debugInfo: oauth2Credentials?.debugInfo,
+  ...(executionMode ? { executionMode } : {})
+});
+
+const buildOauth2DebugEventPayload = ({ collection, oauth2Credentials, basePayload }) => redactAwsOutput(collection, {
+  type: 'oauth2-debug',
+  ...basePayload,
+  url: oauth2Credentials.url,
+  credentialsId: oauth2Credentials.credentialsId,
+  debugInfo: oauth2Credentials.debugInfo
+});
+
+const mapVarsByName = (variables = []) => {
+  const out = {};
+  for (const variable of variables || []) {
+    if (variable?.enabled !== false && variable?.name) {
+      out[variable.name] = variable.value;
+    }
+  }
+  return out;
+};
+
+const saveCookies = (url, headers, collection) => {
   if (preferencesUtil.shouldStoreCookies()) {
     let setCookieHeaders = [];
     if (headers['set-cookie']) {
+      const awsSecrets = awsSecretsByCollection.get(collection);
       setCookieHeaders = Array.isArray(headers['set-cookie'])
         ? headers['set-cookie']
         : [headers['set-cookie']];
       for (let setCookieHeader of setCookieHeaders) {
-        if (typeof setCookieHeader === 'string' && setCookieHeader.length) {
+        if (
+          typeof setCookieHeader === 'string'
+          && setCookieHeader.length
+          && !containsProtectedAwsValue(setCookieHeader, awsSecrets?.secretValues)
+        ) {
           addCookieToJar(setCookieHeader, url);
         }
       }
@@ -396,7 +511,11 @@ const fetchGqlSchemaHandler = async (event, endpoint, environment, _request, col
     const resolvedRequest = cloneDeep(_request);
     // mergeVars modifies the request in place, but we'll assign it to ensure consistency
     mergeVars(collection, resolvedRequest, requestTreePath);
-    const envVars = getEnvVars(environment);
+    const envVars = await resolveAwsSecretsForEnvironment({
+      collection,
+      environment,
+      envVars: getEnvVars(environment)
+    });
 
     const globalEnvironmentVars = collection.globalEnvironmentVariables;
     const folderVars = resolvedRequest.folderVariables;
@@ -481,6 +600,16 @@ const registerNetworkIpc = (mainWindow) => {
     });
   };
 
+  const makeRedactedConsoleLog = (collection) => (type, args) => {
+    const redactedArgs = redactAwsOutput(collection, args || []);
+    console[type](...redactedArgs);
+
+    mainWindow.webContents.send('main:console-log', {
+      type,
+      args: redactedArgs
+    });
+  };
+
   const { sendRunnerRequestSent, sendRunnerResponseReceived } = createRunnerExchangeEmitters(mainWindow);
 
   const notifyScriptExecution = ({
@@ -489,19 +618,21 @@ const registerNetworkIpc = (mainWindow) => {
     scriptType, // 'pre-request' | 'post-response' | 'test'
     error, // optional Error
     collectionPath, // optional path to the collection root
-    scriptMetadata // optional metadata for line mapping
+    scriptMetadata, // optional metadata for line mapping
+    collection
   }) => {
-    const errorContext = error ? formatErrorWithContextV2(error, scriptType, scriptMetadata, collectionPath) : null;
+    const redact = (value) => (collection ? redactAwsOutput(collection, value) : value);
+    const errorContext = error ? redact(formatErrorWithContextV2(error, scriptType, scriptMetadata, collectionPath)) : null;
 
     mainWindow.webContents.send(channel, {
       type: `${scriptType}-script-execution`,
       ...basePayload,
-      errorMessage: error ? (error.message || `An error occurred in ${scriptType.replace('-', ' ')} script`) : null,
+      errorMessage: error ? redact(error.message || `An error occurred in ${scriptType.replace('-', ' ')} script`) : null,
       errorContext
     });
   };
 
-  const appendScriptErrorResult = (scriptType, scriptResult, error) => {
+  const appendScriptErrorResult = (scriptType, scriptResult, error, collection) => {
     if (!error) {
       return scriptResult;
     }
@@ -518,12 +649,13 @@ const registerNetworkIpc = (mainWindow) => {
       'pre-request': 'An error occurred while executing the pre-request script.'
     };
 
+    const redact = (value) => (collection ? redactAwsOutput(collection, value) : value);
     const results = [
       ...(scriptResult?.results || []),
       {
         status: 'fail',
         description: descriptionMap[scriptType] || 'Script Error',
-        error: error.message || messageMap[scriptType] || 'An error occurred while executing the script.',
+        error: redact(error.message || messageMap[scriptType] || 'An error occurred while executing the script.'),
         isScriptError: true
       }
     ];
@@ -534,39 +666,61 @@ const registerNetworkIpc = (mainWindow) => {
     };
   };
 
+  const sendRedactedCookiesUpdate = async (collection) => {
+    const domainsWithCookies = await getDomainsWithCookies();
+    mainWindow.webContents.send('main:cookies-update', safeParseJSON(safeStringifyJSON(redactAwsOutput(collection, domainsWithCookies))));
+  };
+
   const sendVariableUpdates = (result, { collectionUid, requestUid, collection }) => {
+    const awsSecrets = awsSecretsByCollection.get(collection);
     if (result.runtimeVariables) {
+      const runtimePayload = filterAwsProtectedVariables(result.runtimeVariables, awsSecrets);
       mainWindow.webContents.send('main:runtime-variables-update', {
-        runtimeVariables: result.runtimeVariables,
+        runtimeVariables: runtimePayload.variables,
+        protectedNames: runtimePayload.protectedNames,
         requestUid,
         collectionUid
       });
     }
 
     if (result.envVariables) {
+      const envPayload = filterAwsProtectedVariables(result.envVariables, awsSecrets, awsSecrets?.originalEnvVars);
       mainWindow.webContents.send('main:script-environment-update', {
-        envVariables: result.envVariables,
+        envVariables: envPayload.variables,
+        protectedNames: envPayload.protectedNames,
         requestUid,
         collectionUid
       });
     }
 
     if (result.globalEnvironmentVariables) {
+      const globalPayload = filterAwsProtectedVariables(
+        result.globalEnvironmentVariables,
+        awsSecrets,
+        collection.globalEnvironmentVariables || {}
+      );
       mainWindow.webContents.send('main:global-environment-variables-update', {
-        globalEnvironmentVariables: result.globalEnvironmentVariables,
+        globalEnvironmentVariables: globalPayload.variables,
+        protectedNames: globalPayload.protectedNames,
         requestUid,
         collectionUid
       });
-      collection.globalEnvironmentVariables = result.globalEnvironmentVariables;
+      collection.globalEnvironmentVariables = globalPayload.variables;
     }
 
     if (result.collectionVariables) {
+      const collectionPayload = filterAwsProtectedVariables(
+        result.collectionVariables,
+        awsSecrets,
+        mapVarsByName((collection.root || collection.draft?.root || {})?.request?.vars?.req)
+      );
       mainWindow.webContents.send('main:collection-variables-update', {
-        collectionVariables: result.collectionVariables,
+        collectionVariables: collectionPayload.variables,
+        protectedNames: collectionPayload.protectedNames,
         requestUid,
         collectionUid
       });
-      applyCollectionVarsToCollectionRoot(collection, result.collectionVariables);
+      applyCollectionVarsToCollectionRoot(collection, collectionPayload.variables);
     }
   };
 
@@ -599,7 +753,8 @@ const registerNetworkIpc = (mainWindow) => {
     runtimeVariables,
     processEnvVars,
     scriptingConfig,
-    runRequestByItemPathname
+    runRequestByItemPathname,
+    consoleLog = onConsoleLog
   ) => {
     // run pre-request script
     let scriptResult;
@@ -614,7 +769,7 @@ const registerNetworkIpc = (mainWindow) => {
         envVars,
         runtimeVariables,
         collectionPath,
-        onConsoleLog,
+        consoleLog,
         processEnvVars,
         scriptingConfig,
         runRequestByItemPathname,
@@ -624,8 +779,7 @@ const registerNetworkIpc = (mainWindow) => {
       sendVariableUpdates(scriptResult, { collectionUid, requestUid, collection });
       resetOauth2Credentials({ oauth2CredentialsToReset: scriptResult.oauth2CredentialsToReset, request, collectionUid });
 
-      const domainsWithCookies = await getDomainsWithCookies();
-      mainWindow.webContents.send('main:cookies-update', safeParseJSON(safeStringifyJSON(domainsWithCookies)));
+      await sendRedactedCookiesUpdate(collection);
     }
 
     // interpolate variables inside request
@@ -705,7 +859,8 @@ const registerNetworkIpc = (mainWindow) => {
     runtimeVariables,
     processEnvVars,
     scriptingConfig,
-    runRequestByItemPathname
+    runRequestByItemPathname,
+    consoleLog = onConsoleLog
   ) => {
     applySentHeadersToRequest(request, response);
     // run post-response vars
@@ -744,7 +899,7 @@ const registerNetworkIpc = (mainWindow) => {
         envVars,
         runtimeVariables,
         collectionPath,
-        onConsoleLog,
+        consoleLog,
         processEnvVars,
         scriptingConfig,
         runRequestByItemPathname,
@@ -754,8 +909,7 @@ const registerNetworkIpc = (mainWindow) => {
       sendVariableUpdates(scriptResult, { collectionUid, requestUid, collection });
       resetOauth2Credentials({ oauth2CredentialsToReset: scriptResult.oauth2CredentialsToReset, request, collectionUid });
 
-      const domainsWithCookiesPost = await getDomainsWithCookies();
-      mainWindow.webContents.send('main:cookies-update', safeParseJSON(safeStringifyJSON(domainsWithCookiesPost)));
+      await sendRedactedCookiesUpdate(collection);
     }
     return scriptResult;
   };
@@ -867,21 +1021,22 @@ const registerNetworkIpc = (mainWindow) => {
       const entries = scriptResult?.scriptedRequestEntries || [];
       if (runInBackground) {
         if (callerBru) {
-          entries.forEach((entry) => callerBru._recordScriptedRequest?.(entry));
+          entries.forEach((entry) => callerBru._recordScriptedRequest?.(redactAwsOutput(collection, entry)));
         }
         return;
       }
       entries.forEach((entry) => {
+        const redactedEntry = redactAwsOutput(collection, entry);
         mainWindow.webContents.send('main:run-request-event', {
           type: 'scripted-request',
           collectionUid,
           itemUid: item.uid,
           requestUid,
           phase,
-          source: entry.source,
-          scope: entry.scope || null,
-          timestamp: entry.startedAt,
-          data: { request: entry.request, response: entry.response, error: entry.error }
+          source: redactedEntry.source,
+          scope: redactedEntry.scope || null,
+          timestamp: redactedEntry.startedAt,
+          data: { request: redactedEntry.request, response: redactedEntry.response, error: redactedEntry.error }
         });
       });
     };
@@ -947,6 +1102,7 @@ const registerNetworkIpc = (mainWindow) => {
 
       // Add certsAndProxyConfig to request object for bru.sendRequest
       request.certsAndProxyConfig = certsAndProxyConfig;
+      const redactedConsoleLog = makeRedactedConsoleLog(collection);
       let preRequestScriptResult = null;
       let preRequestError = null;
       try {
@@ -960,7 +1116,8 @@ const registerNetworkIpc = (mainWindow) => {
           runtimeVariables,
           processEnvVars,
           scriptingConfig,
-          runRequestByItemPathname
+          runRequestByItemPathname,
+          redactedConsoleLog
         );
       } catch (error) {
         preRequestError = error;
@@ -975,12 +1132,12 @@ const registerNetworkIpc = (mainWindow) => {
 
       emitScriptedRequestEvents('pre-request', preRequestScriptResult);
 
-      preRequestScriptResult = appendScriptErrorResult('pre-request', preRequestScriptResult, preRequestError);
+      preRequestScriptResult = appendScriptErrorResult('pre-request', preRequestScriptResult, preRequestError, collection);
 
       if (preRequestScriptResult?.results) {
         mainWindow.webContents.send('main:run-request-event', {
           type: 'test-results-pre-request',
-          results: preRequestScriptResult.results,
+          results: redactAwsOutput(collection, preRequestScriptResult.results),
           itemUid: item.uid,
           requestUid,
           collectionUid
@@ -993,7 +1150,8 @@ const registerNetworkIpc = (mainWindow) => {
         scriptType: 'pre-request',
         error: preRequestError,
         collectionPath,
-        scriptMetadata: request.script?.reqMetadata
+        scriptMetadata: request.script?.reqMetadata,
+        collection
       });
 
       if (preRequestError) {
@@ -1021,14 +1179,14 @@ const registerNetworkIpc = (mainWindow) => {
         }
       });
 
-      requestSent = {
+      requestSent = redactAwsOutput(collection, {
         url: request.url,
         method: request.method,
         headers: headersSent,
         data: requestData,
         dataBuffer: requestDataBuffer,
         timestamp: Date.now()
-      };
+      });
 
       !runInBackground && mainWindow.webContents.send('main:run-request-event', {
         type: 'request-sent',
@@ -1040,26 +1198,20 @@ const registerNetworkIpc = (mainWindow) => {
       });
 
       if (request.oauth2Credentials?.credentials && request.oauth2Credentials?.credentialsId) {
-        mainWindow.webContents.send('main:credentials-update', {
-          credentials: request?.oauth2Credentials?.credentials,
-          url: request?.oauth2Credentials?.url,
+        mainWindow.webContents.send('main:credentials-update', buildOauth2CredentialsEventPayload({
+          collection,
+          oauth2Credentials: request.oauth2Credentials,
           collectionUid,
-          credentialsId: request?.oauth2Credentials?.credentialsId,
-          ...(request?.oauth2Credentials?.folderUid ? { folderUid: request.oauth2Credentials.folderUid } : { itemUid: item.uid }),
-          debugInfo: request?.oauth2Credentials?.debugInfo,
-          // When invoked via bru.runRequest from inside the Runner, route the oauth2 timeline
-          // entry onto the outer runner item instead of leaking into collection.timeline.
-          ...(parentExecutionMode === 'runner' ? { executionMode: 'runner' } : {})
-        });
+          itemUid: item.uid,
+          executionMode: parentExecutionMode === 'runner' ? 'runner' : undefined
+        }));
 
         if (parentExecutionMode === 'runner' && parentRunnerEventData && request.oauth2Credentials.debugInfo) {
-          mainWindow.webContents.send('main:run-folder-event', {
-            type: 'oauth2-debug',
-            ...parentRunnerEventData,
-            url: request.oauth2Credentials.url,
-            credentialsId: request.oauth2Credentials.credentialsId,
-            debugInfo: request.oauth2Credentials.debugInfo
-          });
+          mainWindow.webContents.send('main:run-folder-event', buildOauth2DebugEventPayload({
+            collection,
+            oauth2Credentials: request.oauth2Credentials,
+            basePayload: parentRunnerEventData
+          }));
         }
 
         const { credentialsId, credentials } = request.oauth2Credentials;
@@ -1107,16 +1259,16 @@ const registerNetworkIpc = (mainWindow) => {
         } else {
           await executeRequestOnFailHandler(request, error, (onFailScriptResult) => {
             sendVariableUpdates(onFailScriptResult, { collectionUid, requestUid, collection });
-          });
+          }, collection);
 
           // if it's not a network error, don't continue
           // we are not rejecting the promise here and instead returning a response object with `error` which is handled in the `send-http-request` invocation
           // timeline prop won't be accessible in the usual way in the renderer process if we reject the promise
-          return {
+          return redactAwsOutput(collection, {
             statusText: error.statusText,
             error: error.message || ERROR_OCCURRED_WHILE_EXECUTING_REQUEST,
             timeline: error.timeline
-          };
+          });
         }
       }
 
@@ -1135,13 +1287,11 @@ const registerNetworkIpc = (mainWindow) => {
 
       // save cookies
       if (preferencesUtil.shouldStoreCookies()) {
-        saveCookies(request.url, response.headers);
+        saveCookies(request.url, response.headers, collection);
       }
 
       // send domain cookies to renderer
-      const domainsWithCookies = await getDomainsWithCookies();
-
-      mainWindow.webContents.send('main:cookies-update', safeParseJSON(safeStringifyJSON(domainsWithCookies)));
+      await sendRedactedCookiesUpdate(collection);
       cookiesStore.saveCookieJar();
 
       const runPostScripts = async () => {
@@ -1158,9 +1308,10 @@ const registerNetworkIpc = (mainWindow) => {
             runtimeVariables,
             processEnvVars,
             scriptingConfig,
-            runRequestByItemPathname);
+            runRequestByItemPathname,
+            redactedConsoleLog);
         } catch (error) {
-          console.error('Post-response script error:', error);
+          console.error('Post-response script error:', redactAwsOutput(collection, error));
           postResponseError = error;
         }
 
@@ -1175,12 +1326,12 @@ const registerNetworkIpc = (mainWindow) => {
 
         emitScriptedRequestEvents('post-response', postResponseScriptResult);
 
-        postResponseScriptResult = appendScriptErrorResult('post-response', postResponseScriptResult, postResponseError);
+        postResponseScriptResult = appendScriptErrorResult('post-response', postResponseScriptResult, postResponseError, collection);
 
         if (postResponseScriptResult?.results) {
           mainWindow.webContents.send('main:run-request-event', {
             type: 'test-results-post-response',
-            results: postResponseScriptResult.results,
+            results: redactAwsOutput(collection, postResponseScriptResult.results),
             itemUid: item.uid,
             requestUid,
             collectionUid
@@ -1194,7 +1345,8 @@ const registerNetworkIpc = (mainWindow) => {
           error: postResponseError,
           itemPathname: item.pathname,
           collectionPath,
-          scriptMetadata: request.script?.resMetadata
+          scriptMetadata: request.script?.resMetadata,
+          collection
         });
 
         // run assertions
@@ -1210,7 +1362,7 @@ const registerNetworkIpc = (mainWindow) => {
 
           !runInBackground && mainWindow.webContents.send('main:run-request-event', {
             type: 'assertion-results',
-            results: results,
+            results: redactAwsOutput(collection, results),
             itemUid: item.uid,
             requestUid,
             collectionUid
@@ -1231,7 +1383,7 @@ const registerNetworkIpc = (mainWindow) => {
               envVars,
               runtimeVariables,
               collectionPath,
-              onConsoleLog,
+              redactedConsoleLog,
               processEnvVars,
               scriptingConfig,
               runRequestByItemPathname,
@@ -1255,11 +1407,11 @@ const registerNetworkIpc = (mainWindow) => {
 
           emitScriptedRequestEvents('tests', testResults);
 
-          testResults = appendScriptErrorResult('test', testResults, testError);
+          testResults = appendScriptErrorResult('test', testResults, testError, collection);
 
           !runInBackground && mainWindow.webContents.send('main:run-request-event', {
             type: 'test-results',
-            results: testResults.results,
+            results: redactAwsOutput(collection, testResults.results),
             itemUid: item.uid,
             requestUid,
             collectionUid
@@ -1275,11 +1427,11 @@ const registerNetworkIpc = (mainWindow) => {
             error: testError,
             itemPathname: item.pathname,
             collectionPath,
-            scriptMetadata: request.testsMetadata
+            scriptMetadata: request.testsMetadata,
+            collection
           });
 
-          const domainsWithCookiesTest = await getDomainsWithCookies();
-          mainWindow.webContents.send('main:cookies-update', safeParseJSON(safeStringifyJSON(domainsWithCookiesTest)));
+          await sendRedactedCookiesUpdate(collection);
           cookiesStore.saveCookieJar();
         }
       };
@@ -1296,19 +1448,19 @@ const registerNetworkIpc = (mainWindow) => {
             response.data = data;
             response.dataBuffer = dataBuffer;
           } catch (error) {
-            console.error('Error rebuilding response body from SSE chunks:', error);
+            console.error('Error rebuilding response body from SSE chunks:', redactAwsOutput(collection, error));
           }
           runPostScripts()
             .finally(reportUnresolvedVariables)
             .catch((error) => {
-              console.error('Error running post-response scripts for SSE stream:', error);
+              console.error('Error running post-response scripts for SSE stream:', redactAwsOutput(collection, error));
             });
         });
       } else {
         await runPostScripts();
       }
 
-      return {
+      return redactAwsOutput(collection, {
         status: response.status,
         statusText: response.statusText,
         headers: response.headers,
@@ -1322,18 +1474,18 @@ const registerNetworkIpc = (mainWindow) => {
         url: response.request ? response.request.protocol + '//' + response.request.host + response.request.path : null,
         timeline: response.timeline,
         requestSent
-      };
+      });
     } catch (error) {
       deleteCancelToken(cancelTokenUid);
 
       // we are not rejecting the promise here and instead returning a response object with `error` which is handled in the `send-http-request` invocation
       // timeline prop won't be accessible in the usual way in the renderer process if we reject the promise
-      return {
+      return redactAwsOutput(collection, {
         status: error?.status,
         error: error?.message || ERROR_OCCURRED_WHILE_EXECUTING_REQUEST,
         timeline: error?.timeline,
         requestSent
-      };
+      });
     } finally {
       reportUnresolvedVariables();
     }
@@ -1387,7 +1539,11 @@ const registerNetworkIpc = (mainWindow) => {
   ipcMain.handle('send-http-request', async (event, item, collection, environment, runtimeVariables) => {
     let seq = 0;
     const collectionUid = collection.uid;
-    const envVars = getEnvVars(environment);
+    const envVars = await resolveAwsSecretsForEnvironment({
+      collection,
+      environment,
+      envVars: getEnvVars(environment)
+    });
     const processEnvVars = getProcessEnvVars(collectionUid);
     const response = await runRequest({ item, collection, envVars, processEnvVars, runtimeVariables, runInBackground: false });
     if (response.stream) {
@@ -1406,7 +1562,7 @@ const registerNetworkIpc = (mainWindow) => {
           itemUid: item.uid,
           seq,
           timestamp: Date.now(),
-          data: parsed
+          data: redactAwsStreamChunk(collection, parsed)
         });
       });
 
@@ -1464,7 +1620,11 @@ const registerNetworkIpc = (mainWindow) => {
       const scriptingConfig = get(brunoConfig, 'scripts', {});
       scriptingConfig.runtime = getJsSandboxRuntime(collection);
       scriptingConfig.cacheModules = false;
-      const envVars = getEnvVars(environment);
+      const envVars = await resolveAwsSecretsForEnvironment({
+        collection,
+        environment,
+        envVars: getEnvVars(environment)
+      });
       const processEnvVars = getProcessEnvVars(collectionUid);
       let stopRunnerExecution = false;
       let currentAbortController;
@@ -1559,8 +1719,8 @@ const registerNetworkIpc = (mainWindow) => {
                       status: res.status,
                       statusText: res.statusText,
                       headers: res.headers,
-                      data: res.data,
-                      dataBuffer: res.dataBuffer,
+                      data: redactAwsOutput(collection, res.data),
+                      dataBuffer: redactAwsOutput(collection, res.dataBuffer),
                       size: res.size,
                       duration: res.duration,
                       timeline: res.timeline
@@ -1663,14 +1823,15 @@ const registerNetworkIpc = (mainWindow) => {
           const emitRunnerScriptedRequestEvents = (phase, scriptResult) => {
             const entries = scriptResult?.scriptedRequestEntries || [];
             entries.forEach((entry) => {
+              const redactedEntry = redactAwsOutput(collection, entry);
               mainWindow.webContents.send('main:run-folder-event', {
                 type: 'scripted-request',
                 ...eventData,
                 phase,
-                source: entry.source,
-                scope: entry.scope || null,
-                timestamp: entry.startedAt,
-                data: { request: entry.request, response: entry.response, error: entry.error }
+                source: redactedEntry.source,
+                scope: redactedEntry.scope || null,
+                timestamp: redactedEntry.startedAt,
+                data: { request: redactedEntry.request, response: redactedEntry.response, error: redactedEntry.error }
               });
             });
           };
@@ -1739,6 +1900,7 @@ const registerNetworkIpc = (mainWindow) => {
 
             // Add certsAndProxyConfig to request object for bru.sendRequest
             request.certsAndProxyConfig = certsAndProxyConfig;
+            const redactedConsoleLog = makeRedactedConsoleLog(collection);
 
             let preRequestScriptResult;
             let preRequestError = null;
@@ -1753,10 +1915,11 @@ const registerNetworkIpc = (mainWindow) => {
                 runtimeVariables,
                 processEnvVars,
                 scriptingConfig,
-                runRequestByItemPathname
+                runRequestByItemPathname,
+                redactedConsoleLog
               );
             } catch (error) {
-              console.error('Pre-request script error:', error);
+              console.error('Pre-request script error:', redactAwsOutput(collection, error));
               preRequestError = error;
             }
 
@@ -1765,13 +1928,13 @@ const registerNetworkIpc = (mainWindow) => {
               sendVariableUpdates(preRequestScriptResult, { collectionUid, requestUid, collection });
             }
 
-            preRequestScriptResult = appendScriptErrorResult('pre-request', preRequestScriptResult, preRequestError);
+            preRequestScriptResult = appendScriptErrorResult('pre-request', preRequestScriptResult, preRequestError, collection);
             emitRunnerScriptedRequestEvents('pre-request', preRequestScriptResult);
 
             if (preRequestScriptResult?.results) {
               mainWindow.webContents.send('main:run-folder-event', {
                 type: 'test-results-pre-request',
-                preRequestTestResults: preRequestScriptResult.results,
+                preRequestTestResults: redactAwsOutput(collection, preRequestScriptResult.results),
                 ...eventData
               });
             }
@@ -1783,11 +1946,11 @@ const registerNetworkIpc = (mainWindow) => {
               error: preRequestError,
               itemPathname: item.pathname,
               collectionPath,
-              scriptMetadata: request.script?.reqMetadata
+              scriptMetadata: request.script?.reqMetadata,
+              collection
             });
 
-            const domainsWithCookiesPreRequest = await getDomainsWithCookies();
-            mainWindow.webContents.send('main:cookies-update', safeParseJSON(safeStringifyJSON(domainsWithCookiesPreRequest)));
+            await sendRedactedCookiesUpdate(collection);
 
             if (preRequestError) {
               throw preRequestError;
@@ -1828,14 +1991,14 @@ const registerNetworkIpc = (mainWindow) => {
               }
             });
 
-            let requestSent = {
+            let requestSent = redactAwsOutput(collection, {
               url: request.url,
               method: request.method,
               headers: headersSent,
               data: requestData,
               dataBuffer: requestDataBuffer,
               timestamp: Date.now()
-            };
+            });
 
             // todo:
             // i have no clue why electron can't send the request object
@@ -1857,26 +2020,21 @@ const registerNetworkIpc = (mainWindow) => {
             );
 
             if (request.oauth2Credentials?.credentials && request.oauth2Credentials?.credentialsId) {
-              mainWindow.webContents.send('main:credentials-update', {
-                credentials: request?.oauth2Credentials?.credentials,
-                url: request?.oauth2Credentials?.url,
+              mainWindow.webContents.send('main:credentials-update', buildOauth2CredentialsEventPayload({
+                collection,
+                oauth2Credentials: request.oauth2Credentials,
                 collectionUid,
-                credentialsId: request?.oauth2Credentials?.credentialsId,
-                ...(request?.oauth2Credentials?.folderUid ? { folderUid: request.oauth2Credentials.folderUid } : { itemUid: item.uid }),
-                debugInfo: request?.oauth2Credentials?.debugInfo,
-                // Reducer updates the cache but skips the timeline push for 'runner'.
+                itemUid: item.uid,
                 executionMode: 'runner'
-              });
+              }));
 
               // RunnerTimeline reads oauth from the runner item, not collection.timeline.
               if (request.oauth2Credentials.debugInfo) {
-                mainWindow.webContents.send('main:run-folder-event', {
-                  type: 'oauth2-debug',
-                  ...eventData,
-                  url: request.oauth2Credentials.url,
-                  credentialsId: request.oauth2Credentials.credentialsId,
-                  debugInfo: request.oauth2Credentials.debugInfo
-                });
+                mainWindow.webContents.send('main:run-folder-event', buildOauth2DebugEventPayload({
+                  collection,
+                  oauth2Credentials: request.oauth2Credentials,
+                  basePayload: eventData
+                }));
               }
 
               const { credentialsId, credentials } = request.oauth2Credentials;
@@ -1889,7 +2047,7 @@ const registerNetworkIpc = (mainWindow) => {
                 itemUid: item.uid,
                 collectionUid,
                 collectionOauth2Credentials: collection.oauth2Credentials,
-                requestOauth2Credentials: request.oauth2Credentials
+                requestOauth2Credentials: redactAwsOutput(collection, request.oauth2Credentials)
               });
             }
 
@@ -1919,17 +2077,15 @@ const registerNetworkIpc = (mainWindow) => {
 
               // save cookies
               if (preferencesUtil.shouldStoreCookies()) {
-                saveCookies(request.url, response.headers);
+                saveCookies(request.url, response.headers, collection);
               }
 
               // send domain cookies to renderer
-              const domainsWithCookies = await getDomainsWithCookies();
-
-              mainWindow.webContents.send('main:cookies-update', safeParseJSON(safeStringifyJSON(domainsWithCookies)));
+              await sendRedactedCookiesUpdate(collection);
 
               await sendRunnerResponseReceived({
                 requestUid,
-                responseReceived: {
+                responseReceived: redactAwsOutput(collection, {
                   status: response.status,
                   statusText: response.statusText,
                   headers: response.headers,
@@ -1940,7 +2096,7 @@ const registerNetworkIpc = (mainWindow) => {
                   responseTime: response.responseTime,
                   timeline: response.timeline,
                   url: response.request ? response.request.protocol + '//' + response.request.host + response.request.path : null
-                },
+                }),
                 disableParsingResponseJson: Boolean(request.__brunoDisableParsingResponseJson),
                 eventData
               });
@@ -1960,7 +2116,7 @@ const registerNetworkIpc = (mainWindow) => {
 
                 // save cookies (4XX/5XX responses can also set cookies)
                 if (preferencesUtil.shouldStoreCookies()) {
-                  saveCookies(request.url, error.response.headers);
+                  saveCookies(request.url, error.response.headers, collection);
                 }
 
                 response = {
@@ -1978,14 +2134,14 @@ const registerNetworkIpc = (mainWindow) => {
                 // if we get a response from the server, we consider it as a success
                 await sendRunnerResponseReceived({
                   requestUid,
-                  error: error ? error.message : 'An error occurred while running the request',
-                  responseReceived: response,
+                  error: redactAwsOutput(collection, error ? error.message : 'An error occurred while running the request'),
+                  responseReceived: redactAwsOutput(collection, response),
                   eventData
                 });
               } else {
                 await executeRequestOnFailHandler(request, error, (onFailScriptResult) => {
                   sendVariableUpdates(onFailScriptResult, { collectionUid, requestUid, collection });
-                });
+                }, collection);
 
                 // if it's not a network error, don't continue
                 throw error;
@@ -2006,10 +2162,11 @@ const registerNetworkIpc = (mainWindow) => {
                 runtimeVariables,
                 processEnvVars,
                 scriptingConfig,
-                runRequestByItemPathname
+                runRequestByItemPathname,
+                redactedConsoleLog
               );
             } catch (error) {
-              console.error('Post-response script error:', error);
+              console.error('Post-response script error:', redactAwsOutput(collection, error));
               postResponseError = error;
             }
 
@@ -2020,7 +2177,7 @@ const registerNetworkIpc = (mainWindow) => {
               sendVariableUpdates(postResponseScriptResult, { collectionUid, requestUid, collection });
             }
 
-            postResponseScriptResult = appendScriptErrorResult('post-response', postResponseScriptResult, postResponseError);
+            postResponseScriptResult = appendScriptErrorResult('post-response', postResponseScriptResult, postResponseError, collection);
             emitRunnerScriptedRequestEvents('post-response', postResponseScriptResult);
 
             notifyScriptExecution({
@@ -2030,11 +2187,11 @@ const registerNetworkIpc = (mainWindow) => {
               error: postResponseError,
               itemPathname: item.pathname,
               collectionPath,
-              scriptMetadata: request.script?.resMetadata
+              scriptMetadata: request.script?.resMetadata,
+              collection
             });
 
-            const domainsWithCookiesPostResponse = await getDomainsWithCookies();
-            mainWindow.webContents.send('main:cookies-update', safeParseJSON(safeStringifyJSON(domainsWithCookiesPostResponse)));
+            await sendRedactedCookiesUpdate(collection);
 
             if (postResponseScriptResult?.nextRequestName !== undefined) {
               nextRequestName = postResponseScriptResult.nextRequestName;
@@ -2048,7 +2205,7 @@ const registerNetworkIpc = (mainWindow) => {
             if (postResponseScriptResult?.results) {
               mainWindow.webContents.send('main:run-folder-event', {
                 type: 'test-results-post-response',
-                postResponseTestResults: postResponseScriptResult.results,
+                postResponseTestResults: redactAwsOutput(collection, postResponseScriptResult.results),
                 ...eventData
               });
             }
@@ -2068,7 +2225,7 @@ const registerNetworkIpc = (mainWindow) => {
 
               mainWindow.webContents.send('main:run-folder-event', {
                 type: 'assertion-results',
-                assertionResults: results,
+                assertionResults: redactAwsOutput(collection, results),
                 itemUid: item.uid,
                 collectionUid
               });
@@ -2089,7 +2246,7 @@ const registerNetworkIpc = (mainWindow) => {
                   envVars,
                   runtimeVariables,
                   collectionPath,
-                  onConsoleLog,
+                  redactedConsoleLog,
                   processEnvVars,
                   scriptingConfig,
                   runRequestByItemPathname,
@@ -2112,7 +2269,7 @@ const registerNetworkIpc = (mainWindow) => {
                 }
               }
 
-              testResults = appendScriptErrorResult('test', testResults, testError);
+              testResults = appendScriptErrorResult('test', testResults, testError, collection);
               emitRunnerScriptedRequestEvents('tests', testResults);
 
               if (testResults?.nextRequestName !== undefined) {
@@ -2125,7 +2282,7 @@ const registerNetworkIpc = (mainWindow) => {
 
               mainWindow.webContents.send('main:run-folder-event', {
                 type: 'test-results',
-                testResults: testResults.results,
+                testResults: redactAwsOutput(collection, testResults.results),
                 ...eventData
               });
 
@@ -2139,16 +2296,16 @@ const registerNetworkIpc = (mainWindow) => {
                 error: testError,
                 itemPathname: item.pathname,
                 collectionPath,
-                scriptMetadata: request.testsMetadata
+                scriptMetadata: request.testsMetadata,
+                collection
               });
 
-              const domainsWithCookiesTest = await getDomainsWithCookies();
-              mainWindow.webContents.send('main:cookies-update', safeParseJSON(safeStringifyJSON(domainsWithCookiesTest)));
+              await sendRedactedCookiesUpdate(collection);
             }
           } catch (error) {
             mainWindow.webContents.send('main:run-folder-event', {
               type: 'error',
-              error: error ? error.message : 'An error occurred while running the request',
+              error: redactAwsOutput(collection, error ? error.message : 'An error occurred while running the request'),
               responseReceived: {},
               ...eventData
             });
@@ -2196,14 +2353,14 @@ const registerNetworkIpc = (mainWindow) => {
           });
         }
       } catch (error) {
-        console.log('error', error);
+        console.log('error', redactAwsOutput(collection, error));
         deleteCancelToken(cancelTokenUid);
         mainWindow.webContents.send('main:run-folder-event', {
           type: 'testrun-ended',
           collectionUid,
           folderUid,
           runCompletionTime: new Date().toISOString(),
-          error: error && !error.isCancel ? error : null
+          error: error && !error.isCancel ? redactAwsOutput(collection, error) : null
         });
       }
     }
@@ -2286,7 +2443,7 @@ const registerNetworkIpc = (mainWindow) => {
  * @param {Error} error - The error that occurred
  * @param {Function} onResult - Callback for handling the script result
  */
-const executeRequestOnFailHandler = async (request, error, onResult) => {
+const executeRequestOnFailHandler = async (request, error, onResult, collection) => {
   if (!request || typeof request.onFailHandler !== 'function') {
     return;
   }
@@ -2314,6 +2471,13 @@ module.exports = registerAllNetworkIpc;
 module.exports.configureRequest = configureRequest;
 module.exports.getCertsAndProxyConfig = getCertsAndProxyConfig;
 module.exports.fetchGqlSchemaHandler = fetchGqlSchemaHandler;
+module.exports.resolveAwsSecretsForEnvironment = resolveAwsSecretsForEnvironment;
+module.exports.filterAwsProtectedVariables = filterAwsProtectedVariables;
+module.exports.redactAwsOutput = redactAwsOutput;
+module.exports.redactAwsStreamChunk = redactAwsStreamChunk;
+module.exports.saveCookies = saveCookies;
+module.exports.buildOauth2CredentialsEventPayload = buildOauth2CredentialsEventPayload;
+module.exports.buildOauth2DebugEventPayload = buildOauth2DebugEventPayload;
 module.exports.executeRequestOnFailHandler = executeRequestOnFailHandler;
 module.exports.buildResponseBodyFromStreamChunks = buildResponseBodyFromStreamChunks;
 module.exports.promisifyStream = promisifyStream;

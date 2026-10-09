@@ -13,6 +13,28 @@ const initialState = {
   _scriptGlobalEnvBaseline: null
 };
 
+const normalizeProtectedNames = (protectedNames) =>
+  new Set((Array.isArray(protectedNames) ? protectedNames : []).filter((name) => typeof name === 'string' && name));
+
+const getEnabledVariableValue = (variables, name) => {
+  const variable = (variables || []).find((v) => v?.enabled && v.name === name);
+  return variable ? { found: true, value: variable.value } : { found: false };
+};
+
+const preserveProtectedScriptVars = (scriptVars, variables, protectedNames) => {
+  const next = { ...(scriptVars || {}) };
+  normalizeProtectedNames(protectedNames).forEach((name) => {
+    const current = getEnabledVariableValue(variables, name);
+    if (current.found) {
+      next[name] = current.value;
+      return;
+    }
+
+    delete next[name];
+  });
+  return next;
+};
+
 // Properties prefixed with `_` (e.g. `_scriptGlobalEnvBaseline`) are transient runtime state —
 // never persisted to disk or included in exports.
 export const globalEnvironmentsSlice = createSlice({
@@ -310,7 +332,7 @@ export const deleteGlobalEnvironment = ({ environmentUid }) => (dispatch, getSta
   });
 };
 
-export const globalEnvironmentsUpdateEvent = ({ globalEnvironmentVariables }) => (dispatch, getState) => {
+export const globalEnvironmentsUpdateEvent = ({ globalEnvironmentVariables, protectedNames }) => (dispatch, getState) => {
   if (!globalEnvironmentVariables) return;
 
   const state = getState();
@@ -327,6 +349,7 @@ export const globalEnvironmentsUpdateEvent = ({ globalEnvironmentVariables }) =>
   });
 
   const skipKeys = ['__name__'];
+  normalizeProtectedNames(protectedNames).forEach((name) => skipKeys.push(name));
 
   // add inherited variables names to `skipKeys` to avoid the `create new variable` path
   // except the variables whose values have been updated.
@@ -354,15 +377,20 @@ export const globalEnvironmentsUpdateEvent = ({ globalEnvironmentVariables }) =>
   const updatedEnv = updatedState?.globalEnvironments?.globalEnvironments?.find((env) => env?.uid == environmentUid);
   const baseline = updatedState?.globalEnvironments?._scriptGlobalEnvBaseline;
   let variables = cloneDeep(updatedEnv?.variables || []);
+  const effectiveGlobalEnvironmentVariables = preserveProtectedScriptVars(
+    globalEnvironmentVariables,
+    variables,
+    protectedNames
+  );
 
-  variables = applyScriptEnvVars(variables, globalEnvironmentVariables, baseline, { skipKeys, inheritedVariables });
+  variables = applyScriptEnvVars(variables, effectiveGlobalEnvironmentVariables, baseline, { skipKeys, inheritedVariables });
 
   // Re-infer dataType only for vars the script actually modified — preserves draft-only type edits
   // when a script does a structurally-equal no-op write.
-  const modifiedKeys = getScriptModifiedKeys(globalEnvironmentVariables, baseline, { skipKeys });
+  const modifiedKeys = getScriptModifiedKeys(effectiveGlobalEnvironmentVariables, baseline, { skipKeys });
   variables.forEach((v) => {
     if (!modifiedKeys.has(v.name)) return;
-    const inferred = getDataTypeFromValue(globalEnvironmentVariables[v.name]);
+    const inferred = getDataTypeFromValue(effectiveGlobalEnvironmentVariables[v.name]);
     if (inferred === 'string') {
       delete v.dataType;
     } else {

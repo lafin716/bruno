@@ -6,7 +6,7 @@ const deleteHeaderIfExists = (headers, header) => {
   });
 };
 
-const sanitizeResultsForReporter = (results, { skipAllHeaders = false, skipHeaders = [], skipRequestBody = false, skipResponseBody = false } = {}) => {
+const sanitizeResultsForReporter = (results, { skipAllHeaders = false, skipHeaders = [], skipRequestBody = false, skipResponseBody = false, redactor = null } = {}) => {
   if (skipAllHeaders) {
     results.forEach((result) => {
       result.request.headers = {};
@@ -38,6 +38,12 @@ const sanitizeResultsForReporter = (results, { skipAllHeaders = false, skipHeade
   if (skipResponseBody) {
     results.forEach((result) => {
       delete result.response?.data;
+    });
+  }
+
+  if (typeof redactor === 'function') {
+    results.forEach((result, index) => {
+      results[index] = redactor(result);
     });
   }
 };

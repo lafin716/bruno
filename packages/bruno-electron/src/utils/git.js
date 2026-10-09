@@ -4,12 +4,14 @@ const os = require('os');
 const path = require('path');
 const { exec } = require('child_process');
 const { parseRequest } = require('@usebruno/filestore');
+const { GitLabStore, normalizeGitLabBaseUrl } = require('../store/gitlab');
 
 let collectionPathToGitRootPathMap = new Map();
 
 const simpleGitInstances = new Map();
 
 const REMOTE_BRANCH_LISTING_TIMEOUT_MS = 10000;
+const GITLAB_ASKPASS_USERNAME = 'oauth2';
 
 const getGitVersion = () => {
   return new Promise((resolve, reject) => {
@@ -32,18 +34,271 @@ const getSimpleGitInstanceForPath = (gitRootPath) => {
   return git;
 };
 
-const handleGitOutput = ({ win, processUid, sendStdout = false }) => (command, stdout, stderr) => {
-  const sendProgressUpdate = (data) => {
+const sanitizeGitError = (error, token) => {
+  const message = error?.message || String(error || 'Git operation failed');
+  return token ? message.split(token).join('[REDACTED]') : message;
+};
+
+const redactText = (value, redactions = []) => {
+  let redacted = String(value || '');
+  redactions
+    .filter((redaction) => typeof redaction === 'string' && redaction.length > 0)
+    .forEach((redaction) => {
+      redacted = redacted.split(redaction).join('[REDACTED]');
+    });
+  return redacted;
+};
+
+const createGitOutputRedactor = (redactions = []) => {
+  const values = redactions.filter((redaction) => typeof redaction === 'string' && redaction.length > 0);
+  const boundaryLength = Math.max(0, ...values.map((value) => value.length - 1));
+  let pending = '';
+
+  return {
+    push(data) {
+      const combined = pending + data.toString();
+      const redacted = redactText(combined, values);
+      if (!values.length || redacted.length <= boundaryLength) {
+        pending = combined;
+        return '';
+      }
+
+      const emitLength = redacted.length - boundaryLength;
+      pending = redacted.slice(emitLength);
+      return redacted.slice(0, emitLength);
+    },
+    flush() {
+      const flushed = redactText(pending, values);
+      pending = '';
+      return flushed;
+    }
+  };
+};
+
+const isHttpGitUrl = (url) => {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch (error) {
+    return false;
+  }
+};
+
+const matchesGitLabRepositoryUrl = (baseUrl, repositoryUrl) => {
+  if (!baseUrl || !repositoryUrl || !isHttpGitUrl(repositoryUrl)) {
+    return false;
+  }
+
+  const normalizedBaseUrl = normalizeGitLabBaseUrl(baseUrl);
+  const base = new URL(normalizedBaseUrl);
+  const repository = new URL(repositoryUrl);
+
+  if (repository.username || repository.password || repository.search || repository.hash) {
+    return false;
+  }
+
+  if (base.protocol !== repository.protocol || base.host !== repository.host) {
+    return false;
+  }
+
+  const basePath = base.pathname.replace(/\/+$/, '');
+  const repositoryPath = repository.pathname.replace(/\/+$/, '');
+  return !basePath || repositoryPath === basePath || repositoryPath.startsWith(`${basePath}/`);
+};
+
+const getGitLabCredentialsForRepositoryUrl = (url) => {
+  try {
+    const store = new GitLabStore();
+    const settings = store.getSettings();
+    if (!settings.configured || !matchesGitLabRepositoryUrl(settings.baseUrl, url)) {
+      return null;
+    }
+
+    const token = store.getToken();
+    if (!token) {
+      return null;
+    }
+
+    return {
+      baseUrl: settings.baseUrl,
+      remoteUrl: url,
+      expectedPromptHost: new URL(url).host,
+      token,
+      username: GITLAB_ASKPASS_USERNAME
+    };
+  } catch (error) {
+    return null;
+  }
+};
+
+const createGitAskPassHelper = ({ expectedPromptHost } = {}) => [
+  'const prompt = process.argv.slice(2).join(" ");',
+  'const expectedHost = process.env.BRUNO_GITLAB_EXPECTED_PROMPT_HOST || "";',
+  'const match = prompt.match(/https?:\\/\\/[^\\s\'"<>]+/i);',
+  'if (!match || !expectedHost) process.exit(1);',
+  'let parsed;',
+  'try { parsed = new URL(match[0]); } catch (error) { process.exit(1); }',
+  'if (parsed.host.toLowerCase() !== expectedHost.toLowerCase()) process.exit(1);',
+  'if (/username/i.test(prompt)) {',
+  '  process.stdout.write(process.env.BRUNO_GITLAB_USERNAME || "");',
+  '} else {',
+  '  process.stdout.write(process.env.BRUNO_GITLAB_TOKEN || "");',
+  '}'
+].join('\n');
+
+const createGitAskPassScript = ({ username, token, expectedPromptHost }) => {
+  const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'bruno-gitlab-askpass-'));
+  const scriptPath = path.join(temporaryDirectory, process.platform === 'win32' ? 'askpass.cmd' : 'askpass.sh');
+  const helperPath = path.join(temporaryDirectory, 'askpass-helper.js');
+
+  const script = process.platform === 'win32'
+    ? [
+        '@echo off',
+        'set ELECTRON_RUN_AS_NODE=1',
+        '"%BRUNO_GITLAB_ASKPASS_NODE%" "%BRUNO_GITLAB_ASKPASS_HELPER%" %*'
+      ].join('\r\n')
+    : [
+        '#!/bin/sh',
+        'ELECTRON_RUN_AS_NODE=1 "$BRUNO_GITLAB_ASKPASS_NODE" "$BRUNO_GITLAB_ASKPASS_HELPER" "$@"'
+      ].join('\n');
+
+  fs.writeFileSync(helperPath, createGitAskPassHelper({ expectedPromptHost }), { mode: 0o600 });
+  fs.writeFileSync(scriptPath, script, { mode: 0o700 });
+  fs.chmodSync(scriptPath, 0o700);
+
+  return {
+    scriptPath,
+    helperPath,
+    cleanup: () => fs.rmSync(temporaryDirectory, { recursive: true, force: true }),
+    env: {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: '0',
+      GIT_ASKPASS: scriptPath,
+      BRUNO_GITLAB_ASKPASS_NODE: process.execPath,
+      BRUNO_GITLAB_ASKPASS_HELPER: helperPath,
+      BRUNO_GITLAB_USERNAME: username || GITLAB_ASKPASS_USERNAME,
+      BRUNO_GITLAB_TOKEN: token,
+      BRUNO_GITLAB_EXPECTED_PROMPT_HOST: expectedPromptHost || ''
+    }
+  };
+};
+
+const withGitAskPass = async (credentials, operation) => {
+  const askPass = createGitAskPassScript(credentials);
+  try {
+    return await operation(askPass.env);
+  } catch (error) {
+    throw new Error(sanitizeGitError(error, credentials?.token));
+  } finally {
+    askPass.cleanup();
+  }
+};
+
+const getFreshSimpleGitInstanceForPath = (gitRootPath) => simpleGit(gitRootPath);
+
+const getRemoteUrl = async ({ gitRootPath, remote = 'origin', push = false }) => {
+  const git = getFreshSimpleGitInstanceForPath(gitRootPath);
+  const args = ['remote', 'get-url'];
+  if (push) {
+    args.push('--push');
+  }
+  args.push(remote);
+  return (await git.raw(args)).trim();
+};
+
+const getGitLabCredentialsForRemote = async ({ gitRootPath, remote = 'origin', push = false }) => {
+  try {
+    const remoteUrl = await getRemoteUrl({ gitRootPath, remote, push });
+    const credentials = getGitLabCredentialsForRepositoryUrl(remoteUrl);
+    return credentials ? { ...credentials, remoteUrl } : null;
+  } catch (error) {
+    return null;
+  }
+};
+
+const parseGitUrlRewriteRules = (configOutput) => String(configOutput || '')
+  .split(/\r\n|\r|\n/)
+  .map((line) => line.trim())
+  .filter(Boolean)
+  .map((line) => {
+    const separatorIndex = line.search(/\s/);
+    if (separatorIndex === -1) {
+      return null;
+    }
+    return {
+      key: line.slice(0, separatorIndex),
+      value: line.slice(separatorIndex).trim()
+    };
+  })
+  .filter((rule) => rule && rule.value);
+
+const getGitUrlRewriteRules = async (gitRootPath) => {
+  try {
+    const git = getFreshSimpleGitInstanceForPath(gitRootPath || os.tmpdir());
+    const output = await git.raw(['config', '--get-regexp', '^url\\..*\\.(insteadOf|pushInsteadOf)$']);
+    return parseGitUrlRewriteRules(output);
+  } catch (error) {
+    return [];
+  }
+};
+
+const assertNoMatchingGitUrlRewrite = async ({ gitRootPath, targetUrl }) => {
+  const rules = await getGitUrlRewriteRules(gitRootPath);
+  const matchingRule = rules.find((rule) => targetUrl && targetUrl.startsWith(rule.value));
+  if (matchingRule) {
+    throw new Error(`Git URL rewrite config ${matchingRule.key} matches this GitLab URL; refusing to send saved GitLab credentials`);
+  }
+};
+
+const runAuthenticatedGitRaw = async ({ gitRootPath, credentials, args, win, processUid, sendStdout = true }) => {
+  if (credentials?.remoteUrl) {
+    await assertNoMatchingGitUrlRewrite({ gitRootPath, targetUrl: credentials.remoteUrl });
+  }
+
+  const git = getFreshSimpleGitInstanceForPath(gitRootPath);
+  if (win && processUid) {
+    git.outputHandler(handleGitOutput({ win, processUid, sendStdout, redactions: [credentials?.token] }));
+  }
+
+  return withGitAskPass(credentials, (env) =>
+    git
+      .env(env)
+      .raw(['-c', 'credential.helper=', '-c', 'http.followRedirects=false', ...args])
+  );
+};
+
+const handleGitOutput = ({ win, processUid, sendStdout = false, redactions = [] }) => (command, stdout, stderr) => {
+  const sendProgressUpdate = (redactor) => (data) => {
+    const redactedData = redactor.push(data);
+    if (!redactedData) {
+      return;
+    }
     win.webContents.send('main:update-git-operation-progress', {
       uid: processUid,
-      data: data.toString()
+      data: redactedData
+    });
+  };
+  const flushProgressUpdate = (redactor) => () => {
+    const redactedData = redactor.flush();
+    if (!redactedData) {
+      return;
+    }
+    win.webContents.send('main:update-git-operation-progress', {
+      uid: processUid,
+      data: redactedData
     });
   };
 
-  stderr.on('data', sendProgressUpdate);
+  const stderrRedactor = createGitOutputRedactor(redactions);
+  stderr.on('data', sendProgressUpdate(stderrRedactor));
+  stderr.on('end', flushProgressUpdate(stderrRedactor));
+  stderr.on('close', flushProgressUpdate(stderrRedactor));
 
   if (sendStdout) {
-    stdout.on('data', sendProgressUpdate);
+    const stdoutRedactor = createGitOutputRedactor(redactions);
+    stdout.on('data', sendProgressUpdate(stdoutRedactor));
+    stdout.on('end', flushProgressUpdate(stdoutRedactor));
+    stdout.on('close', flushProgressUpdate(stdoutRedactor));
   }
 };
 
@@ -535,13 +790,16 @@ const getCollectionGitTagsWithDetails = (gitRootPath) => {
 const canPush = async (gitRootPath) => {
   const git = getSimpleGitInstanceForPath(gitRootPath);
   const branch = await git.revparse(['--abbrev-ref', 'HEAD']);
-  const remote = await git.listRemote(['--get-url', 'origin']);
+  const remote = await getRemoteUrl({ gitRootPath, remote: 'origin' });
 
   if (!remote) {
     throw new Error('Remote not configured');
   }
 
-  const remoteInfo = await git.lsRemote(['--refs', remote]);
+  const gitLabCredentials = getGitLabCredentialsForRepositoryUrl(remote);
+  const remoteInfo = gitLabCredentials
+    ? await runAuthenticatedGitRaw({ gitRootPath, credentials: gitLabCredentials, args: ['ls-remote', '--refs', remote], sendStdout: false })
+    : await git.lsRemote(['--refs', remote]);
   const logs = await git.log({ maxCount: 1 });
   const localHead = logs.latest.hash;
   const remoteRefs = remoteInfo.split('\n');
@@ -581,25 +839,41 @@ const pushGitChanges = async (win, { gitRootPath, processUid, remote, remoteBran
 
         const trackingBranch = currentBranch.tracking;
 
-        if (!trackingBranch) {
-          // Set the upstream tracking branch
-          git.push(['--set-upstream', remote, remoteBranch], (err, res) => {
-            if (err) {
-              reject(err);
-            } else {
-              resolve(res);
+        getGitLabCredentialsForRemote({ gitRootPath, remote, push: true })
+          .then((gitLabCredentials) => {
+            if (gitLabCredentials) {
+              const pushArgs = trackingBranch
+                ? ['push', remote, remoteBranch]
+                : ['push', '--set-upstream', remote, remoteBranch];
+              return runAuthenticatedGitRaw({ gitRootPath, credentials: gitLabCredentials, args: pushArgs, win, processUid });
             }
-          });
-        } else {
-          // Push the local branch to the remote
-          git.push(remote, remoteBranch, (err, res) => {
-            if (err) {
-              reject(err);
-            } else {
-              resolve(res);
+
+            if (!trackingBranch) {
+              // Set the upstream tracking branch
+              return new Promise((resolvePush, rejectPush) => {
+                git.push(['--set-upstream', remote, remoteBranch], (err, res) => {
+                  if (err) {
+                    rejectPush(err);
+                  } else {
+                    resolvePush(res);
+                  }
+                });
+              });
             }
-          });
-        }
+
+            // Push the local branch to the remote
+            return new Promise((resolvePush, rejectPush) => {
+              git.push(remote, remoteBranch, (err, res) => {
+                if (err) {
+                  rejectPush(err);
+                } else {
+                  resolvePush(res);
+                }
+              });
+            });
+          })
+          .then(resolve)
+          .catch(reject);
       });
     } catch (error) {
       reject(error);
@@ -612,6 +886,17 @@ const pullGitChanges = async (win, data) => {
   if (strategy !== '--no-rebase' && strategy !== '--ff-only') {
     throw new Error('Invalid strategy');
   }
+  const gitLabCredentials = await getGitLabCredentialsForRemote({ gitRootPath, remote });
+  if (gitLabCredentials) {
+    return runAuthenticatedGitRaw({
+      gitRootPath,
+      credentials: gitLabCredentials,
+      args: ['pull', remote, remoteBranch, strategy],
+      win,
+      processUid
+    });
+  }
+
   return new Promise((resolve, reject) => {
     const git = getSimpleGitInstanceForPath(gitRootPath);
     git.outputHandler(handleGitOutput({ win, processUid, sendStdout: true })).pull(remote, remoteBranch, [strategy], (err, res) => {
@@ -712,6 +997,23 @@ const getCollectionGitData = async (gitRootPath, collectionPath) => {
 const cloneGitRepository = async (win, data) => {
   return new Promise((resolve, reject) => {
     const { url, path, processUid, branch } = data;
+    const gitLabCredentials = getGitLabCredentialsForRepositoryUrl(url);
+    if (gitLabCredentials) {
+      const git = simpleGit({ baseDir: os.tmpdir() });
+      const cloneArgs = ['-c', 'credential.helper=', '-c', 'http.followRedirects=false', 'clone', '--progress'];
+      if (branch) {
+        cloneArgs.push('--branch', branch);
+      }
+      cloneArgs.push(url, path);
+
+      git.outputHandler(handleGitOutput({ win, processUid, sendStdout: true, redactions: [gitLabCredentials.token] }));
+      assertNoMatchingGitUrlRewrite({ gitRootPath: os.tmpdir(), targetUrl: url })
+        .then(() => withGitAskPass(gitLabCredentials, (env) => git.env(env).raw(cloneArgs)))
+        .then(resolve)
+        .catch(reject);
+      return;
+    }
+
     const git = getSimpleGitInstanceForPath(path);
     const cloneOptions = branch ? ['--progress', '--branch', branch] : ['--progress'];
 
@@ -752,7 +1054,22 @@ const parseRemoteBranches = (lsRemoteOutput) => {
 };
 
 const listBranchesForRemoteUrl = async ({ url }) => {
+  const gitLabCredentials = getGitLabCredentialsForRepositoryUrl(url);
   try {
+    if (gitLabCredentials) {
+      await assertNoMatchingGitUrlRewrite({ gitRootPath: os.tmpdir(), targetUrl: url });
+      const output = await withGitAskPass(gitLabCredentials, (env) =>
+        simpleGit({
+          baseDir: os.tmpdir(),
+          timeout: { block: REMOTE_BRANCH_LISTING_TIMEOUT_MS, stdOut: false, stdErr: false }
+        })
+          .env(env)
+          .raw(['-c', 'credential.helper=', '-c', 'http.followRedirects=false', 'ls-remote', '--symref', url, 'HEAD', 'refs/heads/*'])
+      );
+
+      return parseRemoteBranches(output);
+    }
+
     const output = await simpleGit({
       baseDir: os.tmpdir(),
       timeout: { block: REMOTE_BRANCH_LISTING_TIMEOUT_MS, stdOut: false, stdErr: false }
@@ -762,8 +1079,9 @@ const listBranchesForRemoteUrl = async ({ url }) => {
 
     return parseRemoteBranches(output);
   } catch (error) {
-    console.error('Error listing remote branches:', error);
-    throw error;
+    const message = sanitizeGitError(error, gitLabCredentials?.token);
+    console.error('Error listing remote branches:', message);
+    throw new Error(message);
   }
 };
 
@@ -782,7 +1100,17 @@ const fetchRemotes = (gitRootPath) => {
   });
 };
 
-const fetchChanges = (gitRootPath, remote = 'origin') => {
+const fetchChanges = async (gitRootPath, remote = 'origin') => {
+  const gitLabCredentials = await getGitLabCredentialsForRemote({ gitRootPath, remote });
+  if (gitLabCredentials) {
+    return runAuthenticatedGitRaw({
+      gitRootPath,
+      credentials: gitLabCredentials,
+      args: ['fetch', remote],
+      sendStdout: false
+    });
+  }
+
   return new Promise((resolve, reject) => {
     const git = getSimpleGitInstanceForPath(gitRootPath);
     git.fetch(remote, (err, res) => {
@@ -1831,6 +2159,21 @@ module.exports = {
   cloneGitRepository,
   listBranchesForRemoteUrl,
   parseRemoteBranches,
+  handleGitOutput,
+  createGitOutputRedactor,
+  redactText,
+  matchesGitLabRepositoryUrl,
+  getGitLabCredentialsForRepositoryUrl,
+  createGitAskPassScript,
+  createGitAskPassHelper,
+  withGitAskPass,
+  sanitizeGitError,
+  getRemoteUrl,
+  getGitLabCredentialsForRemote,
+  parseGitUrlRewriteRules,
+  getGitUrlRewriteRules,
+  assertNoMatchingGitUrlRewrite,
+  runAuthenticatedGitRaw,
   fetchChanges,
   fetchRemotes,
   fetchRemoteBranches,

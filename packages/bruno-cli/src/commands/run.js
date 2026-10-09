@@ -16,8 +16,9 @@ const { findItemInCollection, createCollectionJsonFromPathname, getCallStack, ge
 const { hasExecutableTestInScript } = require('../utils/request');
 const { createSkippedFileResults } = require('../utils/run');
 const { sanitizeResultsForReporter } = require('../utils/sanitize-results');
-const { getSystemProxy } = require('@usebruno/requests');
+const { createAwsSecretRedactor, getSystemProxy } = require('@usebruno/requests');
 const { loadEnvironmentFromFile } = require('../utils/environment');
+const { resolveCliAwsExternalSecrets } = require('../utils/aws-secrets');
 const command = 'run [paths...]';
 const desc = 'Run one or more requests/folders';
 
@@ -125,6 +126,19 @@ const builder = async (yargs) => {
     })
     .option('env-var', {
       describe: 'Overwrite a single environment variable, multiple usages possible',
+      type: 'string'
+    })
+    .option('aws-secrets', {
+      describe: 'Resolve AWS Secrets Manager external secret references for this run',
+      type: 'boolean',
+      default: false
+    })
+    .option('aws-region', {
+      describe: 'Default AWS region for AWS Secrets Manager external secret references',
+      type: 'string'
+    })
+    .option('aws-profile', {
+      describe: 'Default AWS profile for AWS Secrets Manager external secret references',
       type: 'string'
     })
     .option('global-env-var', {
@@ -307,6 +321,9 @@ const handler = async function (argv) {
       globalEnv,
       workspacePath,
       envVar,
+      awsSecrets,
+      awsRegion,
+      awsProfile,
       globalEnvVar,
       insecure,
       r: recursive,
@@ -376,6 +393,8 @@ const handler = async function (argv) {
     let globalEnvVars = {};
     let envFileDescriptor = null;
     let globalEnvFileDescriptor = null;
+    let awsExternalSecrets = null;
+    let awsResolvedSecrets = { variables: {}, secretNames: new Set(), secretValues: new Set() };
     // Enabled entries of an `--env-file`, handed to a `--env` passed alongside it: both files'
     // variables reach the same runtime map, but only the `--env` file is written back, and a name
     // belongs to the file that declares it.
@@ -406,11 +425,12 @@ const handler = async function (argv) {
       try {
         // An `--env-file` is loaded exactly as the file reads: its `extends` chain is left
         // unresolved, even when the path points at one of the collection's own environments.
-        const { variables: environmentVariables, ownVariables } = loadEnvironmentFromFile({
+        const { variables: environmentVariables, ownVariables, externalSecrets } = loadEnvironmentFromFile({
           filePath: envFilePath,
           resolveInheritance: false
         });
         envVars = environmentVariables;
+        awsExternalSecrets = externalSecrets;
         envFileVariables = ownVariables;
         envFileDescriptor = {
           path: envFilePath,
@@ -439,8 +459,9 @@ const handler = async function (argv) {
         const defaultEnvFilePath = path.join(collectionPath, 'environments', `${defaultEnvironment}${envExt}`);
         if (await exists(defaultEnvFilePath)) {
           try {
-            const { variables: environmentVariables, inheritedVariables: inheritedEnvironmentVariables } = loadEnvironmentFromFile({ filePath: defaultEnvFilePath, name: defaultEnvironment });
+            const { variables: environmentVariables, inheritedVariables: inheritedEnvironmentVariables, externalSecrets } = loadEnvironmentFromFile({ filePath: defaultEnvFilePath, name: defaultEnvironment });
             envVars = { ...envVars, ...environmentVariables };
+            awsExternalSecrets = externalSecrets;
             envFileDescriptor = {
               path: defaultEnvFilePath,
               format: collection.format,
@@ -469,8 +490,9 @@ const handler = async function (argv) {
         process.exit(constants.EXIT_STATUS.ERROR_ENV_NOT_FOUND);
       }
       try {
-        const { variables: environmentVariables, inheritedVariables: inheritedEnvironmentVariables } = loadEnvironmentFromFile({ filePath: collectionEnvFilePath, name: env });
+        const { variables: environmentVariables, inheritedVariables: inheritedEnvironmentVariables, externalSecrets } = loadEnvironmentFromFile({ filePath: collectionEnvFilePath, name: env });
         envVars = { ...envVars, ...environmentVariables };
+        awsExternalSecrets = externalSecrets;
         envFileDescriptor = {
           path: collectionEnvFilePath,
           format: collection.format,
@@ -591,6 +613,27 @@ const handler = async function (argv) {
           globalEnvVars[match[1]] = match[2];
           globalEnvVarOverrides.set(match[1], match[2]);
         }
+      }
+    }
+
+    if (awsExternalSecrets?.type === 'aws-secrets-manager' && awsExternalSecrets.variables != null) {
+      try {
+        awsResolvedSecrets = await resolveCliAwsExternalSecrets({
+          externalSecrets: awsExternalSecrets,
+          enabled: awsSecrets === true,
+          region: awsRegion || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION,
+          profile: awsProfile || process.env.AWS_PROFILE
+        });
+        envVars = {
+          ...envVars,
+          ...awsResolvedSecrets.variables
+        };
+        for (const [key, value] of envVarOverrides) {
+          envVars[key] = value;
+        }
+      } catch (err) {
+        console.error(chalk.red(err?.message || 'Failed to resolve AWS external secrets.'));
+        process.exit(constants.EXIT_STATUS.ERROR_GENERIC);
       }
     }
 
@@ -719,12 +762,16 @@ const handler = async function (argv) {
 
     const collectionRootFile = collection.format === 'yml' ? 'opencollection.yml' : 'collection.bru';
     const collectionRootPath = path.join(collectionPath, collectionRootFile);
+    const awsSecretRedactor = createAwsSecretRedactor(awsResolvedSecrets.secretValues);
     const persistPaths = {
       envFile: envFileDescriptor,
       globalEnvFile: globalEnvFileDescriptor,
       collectionRootPath,
       envVarOverrides,
-      globalEnvVarOverrides
+      globalEnvVarOverrides,
+      protectedNames: awsResolvedSecrets.secretNames,
+      protectedValues: awsResolvedSecrets.secretValues,
+      redactor: awsSecretRedactor
     };
 
     // Fetch system proxy once for all requests (skip if --noproxy flag is set)
@@ -860,7 +907,8 @@ const handler = async function (argv) {
         skipAllHeaders: reporterSkipAllHeaders,
         skipHeaders: reporterSkipHeaders,
         skipRequestBody: reporterSkipRequestBody || reporterSkipBody,
-        skipResponseBody: reporterSkipResponseBody || reporterSkipBody
+        skipResponseBody: reporterSkipResponseBody || reporterSkipBody,
+        redactor: awsSecretRedactor
       });
 
       // bail if option is set and there is a failure

@@ -9,7 +9,7 @@ import filter from 'lodash/filter';
 import each from 'lodash/each';
 import { findCollectionByUid, findItemInCollection, flattenItems, isItemARequest, hasRequestChanges, findEnvironmentInCollection } from 'utils/collections';
 import { addTab, focusTab, reorderTabs } from 'providers/ReduxStore/slices/tabs';
-import { saveMultipleRequests, saveMultipleCollections, saveMultipleFolders, saveEnvironment, reopenClosedTab } from 'providers/ReduxStore/slices/collections/actions';
+import { saveMultipleRequests, saveMultipleCollections, saveMultipleFolders, saveEnvironment, saveExternalSecrets, reopenClosedTab } from 'providers/ReduxStore/slices/collections/actions';
 import { toggleSidebarCollapse, savePreferences } from 'providers/ReduxStore/slices/app';
 import { setLocalStorageValue, SIDEBAR_COLLAPSED_KEY } from 'utils/common/localStorage';
 import { openDevtoolsAndSwitchToTerminal } from 'utils/terminal';
@@ -233,6 +233,11 @@ export const HotkeysProvider = (props) => {
             );
         }
       }
+
+      Object.entries(collection.externalSecretsDrafts || {}).forEach(([environmentUid, externalSecrets]) => {
+        dispatch(saveExternalSecrets(externalSecrets, environmentUid, collectionUid))
+          .catch(() => toast.error('Failed to save AWS secret references'));
+      });
 
       // Request and folder drafts
       const items = flattenItems(collection.items);

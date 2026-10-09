@@ -20,6 +20,25 @@ export { initializeShellEnv, fetchShellEnv } from './utils/shell-env';
 export { getOrCreateHttpsAgent, getOrCreateHttpAgent, clearAgentCache, getAgentCacheSize } from './utils/agent-cache';
 export { getPacResolver, clearPacCache } from './utils/pac-resolver';
 export type { PacWrapper, GetPacResolverParams } from './utils/pac-resolver';
+export {
+  AWS_SECRETS_MANAGER_EXTERNAL_SECRETS_TYPE,
+  AwsSecretsError,
+  createAwsSecretRedactor,
+  createAwsSecretsManagerClient,
+  hasAwsExternalSecrets,
+  redactAwsSecretValues,
+  resolveAwsExternalSecrets,
+  validateAwsExternalSecrets
+} from './utils/aws-secrets';
+export type {
+  AwsCredentials,
+  AwsExternalSecrets,
+  AwsResolvedExternalSecrets,
+  AwsSecretReference,
+  AwsSecretRefValue,
+  AwsSecretsClient,
+  AwsSecretsClientOptions
+} from './utils/aws-secrets';
 
 export * as scripting from './scripting';
 

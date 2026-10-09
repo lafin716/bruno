@@ -9,9 +9,9 @@ import { pluralizeWord } from 'utils/common';
 import { getInvalidVariableNames } from 'utils/common/variables';
 import { isEnvironmentValidationError } from 'utils/environments';
 import { completeQuitFlow } from 'providers/ReduxStore/slices/app';
-import { saveRequest, saveMultipleRequests, saveMultipleCollections, saveMultipleFolders, saveEnvironment, closeTabs } from 'providers/ReduxStore/slices/collections/actions';
+import { saveRequest, saveMultipleRequests, saveMultipleCollections, saveMultipleFolders, saveEnvironment, saveExternalSecrets, closeTabs } from 'providers/ReduxStore/slices/collections/actions';
 import { saveGlobalEnvironment, clearGlobalEnvironmentDraft } from 'providers/ReduxStore/slices/global-environments';
-import { deleteRequestDraft, deleteCollectionDraft, deleteFolderDraft, clearEnvironmentsDraft } from 'providers/ReduxStore/slices/collections';
+import { deleteRequestDraft, deleteCollectionDraft, deleteFolderDraft, clearEnvironmentsDraft, clearExternalSecretsDraft } from 'providers/ReduxStore/slices/collections';
 import { saveApiSpecToFile, clearApiSpecDraft } from 'providers/ReduxStore/slices/apiSpec';
 import { API_SPEC_TAB_TYPE, findApiSpecByPathname, hasUnsavedApiSpecChanges } from 'utils/api-specs';
 import { IconAlertTriangle } from '@tabler/icons';
@@ -64,6 +64,19 @@ const SaveRequestsModal = ({ onClose, forceCloseTabs = false, tabUidsToClose = [
             });
           }
         }
+
+        Object.entries(collection.externalSecretsDrafts || {}).forEach(([environmentUid, externalSecrets]) => {
+          const environment = findEnvironmentInCollection(collection, environmentUid);
+          if (environment) {
+            environmentDrafts.push({
+              type: 'external-secrets',
+              name: `${environment.name} (AWS secret references)`,
+              environmentUid,
+              externalSecrets,
+              collectionUid
+            });
+          }
+        });
 
         // Check for request and folder drafts
         const items = flattenItems(collection.items);
@@ -158,6 +171,9 @@ const SaveRequestsModal = ({ onClose, forceCloseTabs = false, tabUidsToClose = [
           case 'collection-environment':
             dispatch(clearEnvironmentsDraft({ collectionUid: draft.collectionUid }));
             break;
+          case 'external-secrets':
+            dispatch(clearExternalSecretsDraft({ collectionUid: draft.collectionUid, environmentUid: draft.environmentUid }));
+            break;
           case 'global-environment':
             dispatch(clearGlobalEnvironmentDraft());
             break;
@@ -196,6 +212,7 @@ const SaveRequestsModal = ({ onClose, forceCloseTabs = false, tabUidsToClose = [
       const nonTransientRequestDrafts = requestDrafts.filter((d) => !d.isTransient);
       const collectionEnvironmentDrafts = allDrafts.filter((d) => d.type === 'collection-environment');
       const globalEnvironmentDrafts = allDrafts.filter((d) => d.type === 'global-environment');
+      const externalSecretsDrafts = allDrafts.filter((d) => d.type === 'external-secrets');
 
       const apiSpecDrafts = allDrafts.filter((d) => d.type === 'api-spec');
       let hasSkippedApiSpecs = false;
@@ -277,6 +294,15 @@ const SaveRequestsModal = ({ onClose, forceCloseTabs = false, tabUidsToClose = [
         }
       }
 
+      for (const draft of externalSecretsDrafts) {
+        try {
+          await dispatch(saveExternalSecrets(draft.externalSecrets, draft.environmentUid, draft.collectionUid));
+        } catch {
+          hasSkippedEnvs = true;
+          toast.error(`Failed to save AWS secret references for "${draft.name}"`);
+        }
+      }
+
       if (hasSkippedEnvs || hasSkippedApiSpecs) {
         return;
       }
@@ -329,6 +355,9 @@ const SaveRequestsModal = ({ onClose, forceCloseTabs = false, tabUidsToClose = [
               break;
             case 'collection-environment':
               prefix = 'Collection Environment: ';
+              break;
+            case 'external-secrets':
+              prefix = 'External Secrets: ';
               break;
             case 'global-environment':
               prefix = 'Global Environment: ';
